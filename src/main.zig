@@ -4,39 +4,81 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const stdin = std.io.getStdIn().reader();
 const stdout = std.io.getStdOut().writer();
+const assert = std.debug.assert;
 
-const someerr = error{Err};
+const StatementError = error{ General, InvalidInput };
 const MetaCmdRes = enum { META_CMD_SUCCESS, META_CMD_UNRECOGNIZED };
 const StatementType = enum { STATEMENT_INSERT, STATEMENT_SELECT };
-const Statement = struct {
-    type: StatementType,
 
+const Insert = struct {
     const Self = @This();
 
-    pub fn init(inbuf: *InputBuf) !Self {
-        if (inbuf.startsWith("insert")) {
-            return Self{
-                .type = StatementType.STATEMENT_INSERT,
-            };
-        }
+    id: []const u8,
+    username: []const u8,
+    email: []const u8,
 
-        if (inbuf.startsWith("select")) {
-            return Self{
-                .type = StatementType.STATEMENT_SELECT,
-            };
-        }
-
-        return someerr.Err;
+    pub fn exec(self: Self) !void {
+        std.debug.print("INSERTING {s}, {s}, {s}\n", .{ self.id, self.username, self.email });
     }
 
-    pub fn exec(self: *Self) !void {
-        switch (self.type) {
-            StatementType.STATEMENT_INSERT => {
-                std.debug.print("Executing insert...\n", .{});
-            },
-            StatementType.STATEMENT_SELECT => {
-                std.debug.print("Executing select...\n", .{});
-            },
+    pub fn init(id: []const u8, username: []const u8, email: []const u8) Self {
+        return Self{
+            .id = id,
+            .username = username,
+            .email = email,
+        };
+    }
+};
+
+const Select = struct {
+    const Self = @This();
+
+    pub fn exec(self: Self) !void {
+        _ = self;
+        std.debug.print("SELECTING\n", .{});
+    }
+
+    pub fn init() Self {
+        return Self{};
+    }
+};
+
+// Basic "interface" using tagged enum approach
+// See: https://zig.news/kristoff/easy-interfaces-with-zig-0100-2hc5
+const Statement = union(enum) {
+    const Self = @This();
+
+    insert: Insert,
+    select: Select,
+
+    pub fn init(inbuf: *InputBuf) !Self {
+        var tokens = mem.splitScalar(u8, inbuf.getInput(), ' ');
+
+        // not validating
+        const cmd = tokens.next() orelse return StatementError.InvalidInput;
+        if (mem.eql(u8, cmd, "insert")) {
+            const id = tokens.next() orelse return StatementError.InvalidInput;
+            const username = tokens.next() orelse return StatementError.InvalidInput;
+            const email = tokens.next() orelse return StatementError.InvalidInput;
+            const impl = Insert.init(id, username, email);
+            return Self{
+                .insert = impl,
+            };
+        }
+
+        if (mem.eql(u8, cmd, "select")) {
+            const impl = Select.init();
+            return Self{
+                .select = impl,
+            };
+        }
+
+        return StatementError.General;
+    }
+
+    pub fn exec(self: Self) !void {
+        switch (self) {
+            inline else => |case| try case.exec(),
         }
     }
 };
@@ -45,7 +87,7 @@ fn doMetaCmd(inbuf: *InputBuf) !void {
     if (inbuf.startsWith(".exit")) {
         std.os.exit(0);
     } else {
-        return someerr.Err;
+        return StatementError.General;
     }
 }
 
@@ -70,7 +112,7 @@ const InputBuf = struct {
         if (try stdin.readUntilDelimiterOrEof(self.buf, '\n')) |in| {
             self.inlen = in.len;
         } else {
-            std.debug.print("NO INPUT", .{});
+            std.debug.print("INPUT ERROR", .{});
         }
     }
     pub fn getInput(self: *Self) []u8 {
@@ -106,8 +148,13 @@ pub fn main() !void {
         if (Statement.init(&inbuf)) |s| {
             var statement = s;
             try statement.exec();
-        } else |_| {
-            std.debug.print("Unrecognized statement: {s}\n", .{inbuf.getInput()});
+        } else |err| switch (err) {
+            error.InvalidInput => {
+                std.debug.print("Invalid statement input: {s}\n", .{inbuf.getInput()});
+            },
+            error.General => {
+                std.debug.print("Unrecognized statement: {s}\n", .{inbuf.getInput()});
+            },
         }
     }
 }
