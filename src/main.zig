@@ -10,8 +10,14 @@ const StatementError = error{ General, InvalidInput };
 const MetaCmdRes = enum { META_CMD_SUCCESS, META_CMD_UNRECOGNIZED };
 const StatementType = enum { STATEMENT_INSERT, STATEMENT_SELECT };
 
+const ID_SIZE = @sizeOf(u32);
 const USERNAME_SIZE = 32;
 const EMAIL_SIZE = 255;
+const ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
+
+const ID_OFF = 0;
+const USERNAME_OFF = ID_OFF + ID_SIZE;
+const EMAIL_OFF = USERNAME_OFF + USERNAME_SIZE;
 
 const Row = struct {
     const Self = @This();
@@ -19,6 +25,47 @@ const Row = struct {
     id: u32,
     username: [USERNAME_SIZE]u8,
     email: [EMAIL_SIZE]u8,
+
+    pub fn initFromString(idStr: []const u8, usernameStr: []const u8, emailStr: []const u8, allocator: *Allocator) !*Self {
+        const id = try std.fmt.parseInt(u32, idStr, 10); 
+
+        const idBytes = try allocator.alloc(u8, ID_SIZE);
+        mem.writePackedIntNative(u32, idBytes, 0, id);
+
+        return try initFromBytes(idBytes, usernameStr, emailStr, allocator);
+    }
+
+    pub fn initFromBytes(idBytes: []const u8, usernameBytes: []const u8, emailBytes: []const u8, allocator: *Allocator) !*Self {
+        assert(idBytes.len == ID_SIZE);
+        assert(usernameBytes.len <= USERNAME_SIZE);
+        assert(emailBytes.len <= EMAIL_SIZE);
+
+        var row = try allocator.create(Row);
+
+        row.id = mem.readPackedIntNative(u32, idBytes, 0);
+        mem.copyForwards(u8, row.username[0..], usernameBytes);
+        mem.copyForwards(u8, row.email[0..], emailBytes);
+
+        return row;
+    }
+
+    /// Write Row bytes to dest slice
+    pub fn serializeToSlice(self: Self, dest: []u8) void {
+        assert(dest.len >= ROW_SIZE);
+        mem.writePackedIntNative(@TypeOf(self.id), dest[ID_OFF..ID_OFF + ID_SIZE], 0, self.id);
+        mem.copyForwards(u8, dest[USERNAME_OFF..USERNAME_OFF + USERNAME_SIZE], self.username[0..]);
+        mem.copyForwards(u8, dest[EMAIL_OFF..EMAIL_OFF + EMAIL_SIZE], self.email[0..]);
+    }
+
+    /// Initialize a Row from a previously serialized Row
+    pub fn initFromSerializedSlice(src: []u8, allocator: *Allocator) !*Self {
+        assert(src.len >= ROW_SIZE);
+        const idSlice = src[ID_OFF..ID_OFF + ID_SIZE];
+        const usernameSlice = src[USERNAME_OFF..USERNAME_OFF + USERNAME_SIZE];
+        const emailSlice = src[EMAIL_OFF..EMAIL_OFF + EMAIL_SIZE];
+
+        return Row.initFromBytes(idSlice, usernameSlice, emailSlice, allocator);
+    }
 };
 
 const Insert = struct {
@@ -30,21 +77,14 @@ const Insert = struct {
         std.debug.print("INSERTING {d}, {s}, {s}\n", .{ self.row.id, self.row.username, self.row.email });
     }
 
-    pub fn init(maybeId: []const u8, maybeUsername: []const u8, maybeEmail: []const u8, allocator: *Allocator) StatementError!Self {
-        const id = std.fmt.parseInt(u32, maybeId, 10) catch return StatementError.InvalidInput;
-        var row = allocator.create(Row) catch return StatementError.General;
-        
-        assert(maybeUsername.len <= USERNAME_SIZE);
-        assert(maybeEmail.len <= EMAIL_SIZE);
-        mem.copyForwards(u8, row.username[0..], maybeUsername);
-        mem.copyForwards(u8, row.email[0..], maybeEmail);
-        row.id = id;
-        
-        std.debug.print("ROW {any}\n", .{row});
+    pub fn init(idBytes: []const u8, usernameBytes: []const u8, emailBytes: []const u8, allocator: *Allocator) !Self {
+        const row = try Row.initFromString(idBytes, usernameBytes, emailBytes, allocator);
+        // var dest: [ROW_SIZE]u8 = undefined;
+        // row.serializeToSlice(dest[0..]);
+        // const newRow = try Row.initFromSerializedSlice(dest[0..], allocator);
+        // std.debug.print("newRow {any}\n", .{newRow});
 
-        return Self{
-            .row = row
-        };
+        return Self{ .row = row };
     }
 };
 
@@ -165,13 +205,8 @@ pub fn main() !void {
         if (Statement.init(&inbuf, &allocator)) |s| {
             var statement = s;
             try statement.exec();
-        } else |err| switch (err) {
-            error.InvalidInput => {
-                std.debug.print("Invalid statement input: {s}\n", .{inbuf.getInput()});
-            },
-            error.General => {
-                std.debug.print("Something went wrong: {s}\n", .{inbuf.getInput()});
-            },
+        } else |err| {
+            std.debug.print("ERROR ENCOUNTERED: {any} \nFOR INPUT {s}\n", .{err, inbuf.getInput()});
         }
     }
 }
