@@ -10,22 +10,40 @@ const StatementError = error{ General, InvalidInput };
 const MetaCmdRes = enum { META_CMD_SUCCESS, META_CMD_UNRECOGNIZED };
 const StatementType = enum { STATEMENT_INSERT, STATEMENT_SELECT };
 
+const USERNAME_SIZE = 32;
+const EMAIL_SIZE = 255;
+
+const Row = struct {
+    const Self = @This();
+
+    id: u32,
+    username: [USERNAME_SIZE]u8,
+    email: [EMAIL_SIZE]u8,
+};
+
 const Insert = struct {
     const Self = @This();
 
-    id: []const u8,
-    username: []const u8,
-    email: []const u8,
+    row: *Row,
 
     pub fn exec(self: Self) !void {
-        std.debug.print("INSERTING {s}, {s}, {s}\n", .{ self.id, self.username, self.email });
+        std.debug.print("INSERTING {d}, {s}, {s}\n", .{ self.row.id, self.row.username, self.row.email });
     }
 
-    pub fn init(id: []const u8, username: []const u8, email: []const u8) Self {
+    pub fn init(maybeId: []const u8, maybeUsername: []const u8, maybeEmail: []const u8, allocator: *Allocator) StatementError!Self {
+        const id = std.fmt.parseInt(u32, maybeId, 10) catch return StatementError.InvalidInput;
+        var row = allocator.create(Row) catch return StatementError.General;
+        
+        assert(maybeUsername.len <= USERNAME_SIZE);
+        assert(maybeEmail.len <= EMAIL_SIZE);
+        mem.copyForwards(u8, row.username[0..], maybeUsername);
+        mem.copyForwards(u8, row.email[0..], maybeEmail);
+        row.id = id;
+        
+        std.debug.print("ROW {any}\n", .{row});
+
         return Self{
-            .id = id,
-            .username = username,
-            .email = email,
+            .row = row
         };
     }
 };
@@ -51,16 +69,15 @@ const Statement = union(enum) {
     insert: Insert,
     select: Select,
 
-    pub fn init(inbuf: *InputBuf) !Self {
+    pub fn init(inbuf: *InputBuf, allocator: *Allocator) !Self {
         var tokens = mem.splitScalar(u8, inbuf.getInput(), ' ');
 
-        // not validating
         const cmd = tokens.next() orelse return StatementError.InvalidInput;
         if (mem.eql(u8, cmd, "insert")) {
             const id = tokens.next() orelse return StatementError.InvalidInput;
             const username = tokens.next() orelse return StatementError.InvalidInput;
             const email = tokens.next() orelse return StatementError.InvalidInput;
-            const impl = Insert.init(id, username, email);
+            const impl = try Insert.init(id, username, email, allocator);
             return Self{
                 .insert = impl,
             };
@@ -145,7 +162,7 @@ pub fn main() !void {
             }
             continue;
         }
-        if (Statement.init(&inbuf)) |s| {
+        if (Statement.init(&inbuf, &allocator)) |s| {
             var statement = s;
             try statement.exec();
         } else |err| switch (err) {
@@ -153,7 +170,7 @@ pub fn main() !void {
                 std.debug.print("Invalid statement input: {s}\n", .{inbuf.getInput()});
             },
             error.General => {
-                std.debug.print("Unrecognized statement: {s}\n", .{inbuf.getInput()});
+                std.debug.print("Something went wrong: {s}\n", .{inbuf.getInput()});
             },
         }
     }
