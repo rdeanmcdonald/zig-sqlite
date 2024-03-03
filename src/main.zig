@@ -6,9 +6,52 @@ const stdin = std.io.getStdIn().reader();
 const stdout = std.io.getStdOut().writer();
 const assert = std.debug.assert;
 
-const StatementError = error{ General, InvalidInput };
+const DbError = error{ General, InvalidInput, TableFull };
 const MetaCmdRes = enum { META_CMD_SUCCESS, META_CMD_UNRECOGNIZED };
 const StatementType = enum { STATEMENT_INSERT, STATEMENT_SELECT };
+
+const TAB_PAGE_SIZE = 4096;
+const TAB_MAX_PAGES = 100;
+const TAB_ROWS_PER_PAGE = TAB_PAGE_SIZE / ROW_SIZE;
+const TAB_MAX_ROWS = TAB_ROWS_PER_PAGE * TAB_MAX_PAGES;
+
+const Table = struct {
+    const Self = @This();
+    const Page = struct {
+        data: [TAB_PAGE_SIZE]u8,
+    };
+
+    nextAvailableRowIdx: u32,
+    pages: [TAB_MAX_PAGES]?*Page,
+    allocator: *Allocator,
+
+    pub fn init(allocator: *Allocator) Self {
+        return Self{
+            .nextAvailableRowIdx = 0,
+            .pages = undefined,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn insertRow(self: *Self, row: *Row) !void {
+        if (self.nextAvailableRowIdx >= TAB_MAX_ROWS) {
+            return error.TableFull;
+        }
+
+        const pageIdx = @divFloor(self.nextAvailableRowIdx, TAB_ROWS_PER_PAGE);
+        if (self.pages[pageIdx] == null) {
+            self.pages[pageIdx] = try self.allocator.create(Page);
+        }
+
+        var pageData = self.pages[pageIdx].?.data;
+        const rowSlice = pageData[self.nextAvailableRowIdx .. self.nextAvailableRowIdx + ROW_SIZE];
+
+        row.serializeToSlice(rowSlice);
+        self.nextAvailableRowIdx += 1;
+
+        std.debug.print("PAGE DATA {any}\n", .{pageData});
+    }
+};
 
 const ID_SIZE = @sizeOf(u32);
 const USERNAME_SIZE = 32;
@@ -27,9 +70,11 @@ const Row = struct {
     email: [EMAIL_SIZE]u8,
 
     pub fn initFromString(idStr: []const u8, usernameStr: []const u8, emailStr: []const u8, allocator: *Allocator) !*Self {
-        const id = try std.fmt.parseInt(u32, idStr, 10); 
+        const id = try std.fmt.parseInt(u32, idStr, 10);
 
         const idBytes = try allocator.alloc(u8, ID_SIZE);
+        defer allocator.free(idBytes);
+
         mem.writePackedIntNative(u32, idBytes, 0, id);
 
         return try initFromBytes(idBytes, usernameStr, emailStr, allocator);
@@ -52,17 +97,17 @@ const Row = struct {
     /// Write Row bytes to dest slice
     pub fn serializeToSlice(self: Self, dest: []u8) void {
         assert(dest.len >= ROW_SIZE);
-        mem.writePackedIntNative(@TypeOf(self.id), dest[ID_OFF..ID_OFF + ID_SIZE], 0, self.id);
-        mem.copyForwards(u8, dest[USERNAME_OFF..USERNAME_OFF + USERNAME_SIZE], self.username[0..]);
-        mem.copyForwards(u8, dest[EMAIL_OFF..EMAIL_OFF + EMAIL_SIZE], self.email[0..]);
+        mem.writePackedIntNative(@TypeOf(self.id), dest[ID_OFF .. ID_OFF + ID_SIZE], 0, self.id);
+        mem.copyForwards(u8, dest[USERNAME_OFF .. USERNAME_OFF + USERNAME_SIZE], self.username[0..]);
+        mem.copyForwards(u8, dest[EMAIL_OFF .. EMAIL_OFF + EMAIL_SIZE], self.email[0..]);
     }
 
     /// Initialize a Row from a previously serialized Row
     pub fn initFromSerializedSlice(src: []u8, allocator: *Allocator) !*Self {
         assert(src.len >= ROW_SIZE);
-        const idSlice = src[ID_OFF..ID_OFF + ID_SIZE];
-        const usernameSlice = src[USERNAME_OFF..USERNAME_OFF + USERNAME_SIZE];
-        const emailSlice = src[EMAIL_OFF..EMAIL_OFF + EMAIL_SIZE];
+        const idSlice = src[ID_OFF .. ID_OFF + ID_SIZE];
+        const usernameSlice = src[USERNAME_OFF .. USERNAME_OFF + USERNAME_SIZE];
+        const emailSlice = src[EMAIL_OFF .. EMAIL_OFF + EMAIL_SIZE];
 
         return Row.initFromBytes(idSlice, usernameSlice, emailSlice, allocator);
     }
@@ -73,8 +118,9 @@ const Insert = struct {
 
     row: *Row,
 
-    pub fn exec(self: Self) !void {
+    pub fn exec(self: Self, table: *Table) !void {
         std.debug.print("INSERTING {d}, {s}, {s}\n", .{ self.row.id, self.row.username, self.row.email });
+        try table.insertRow(self.row);
     }
 
     pub fn init(idBytes: []const u8, usernameBytes: []const u8, emailBytes: []const u8, allocator: *Allocator) !Self {
@@ -91,8 +137,9 @@ const Insert = struct {
 const Select = struct {
     const Self = @This();
 
-    pub fn exec(self: Self) !void {
+    pub fn exec(self: Self, table: *Table) !void {
         _ = self;
+        _ = table;
         std.debug.print("SELECTING\n", .{});
     }
 
@@ -112,11 +159,11 @@ const Statement = union(enum) {
     pub fn init(inbuf: *InputBuf, allocator: *Allocator) !Self {
         var tokens = mem.splitScalar(u8, inbuf.getInput(), ' ');
 
-        const cmd = tokens.next() orelse return StatementError.InvalidInput;
+        const cmd = tokens.next() orelse return DbError.InvalidInput;
         if (mem.eql(u8, cmd, "insert")) {
-            const id = tokens.next() orelse return StatementError.InvalidInput;
-            const username = tokens.next() orelse return StatementError.InvalidInput;
-            const email = tokens.next() orelse return StatementError.InvalidInput;
+            const id = tokens.next() orelse return DbError.InvalidInput;
+            const username = tokens.next() orelse return DbError.InvalidInput;
+            const email = tokens.next() orelse return DbError.InvalidInput;
             const impl = try Insert.init(id, username, email, allocator);
             return Self{
                 .insert = impl,
@@ -130,12 +177,12 @@ const Statement = union(enum) {
             };
         }
 
-        return StatementError.General;
+        return DbError.General;
     }
 
-    pub fn exec(self: Self) !void {
+    pub fn exec(self: Self, table: *Table) !void {
         switch (self) {
-            inline else => |case| try case.exec(),
+            inline else => |case| try case.exec(table),
         }
     }
 };
@@ -144,7 +191,7 @@ fn doMetaCmd(inbuf: *InputBuf) !void {
     if (inbuf.startsWith(".exit")) {
         std.os.exit(0);
     } else {
-        return StatementError.General;
+        return DbError.General;
     }
 }
 
@@ -193,6 +240,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     var allocator = gpa.allocator();
     var inbuf = try InputBuf.init(&allocator);
+    var table = Table.init(&allocator);
     while (true) {
         printPrompt();
         try inbuf.read();
@@ -204,16 +252,17 @@ pub fn main() !void {
         }
         if (Statement.init(&inbuf, &allocator)) |s| {
             var statement = s;
-            try statement.exec();
+            try statement.exec(&table);
         } else |err| {
-            std.debug.print("ERROR ENCOUNTERED: {any} \nFOR INPUT {s}\n", .{err, inbuf.getInput()});
+            std.debug.print("ERROR ENCOUNTERED: {any} \nFOR INPUT {s}\n", .{ err, inbuf.getInput() });
         }
     }
 }
 
 test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+    const idx: u32 = 14;
+    const pages: [TAB_MAX_PAGES]?usize = undefined;
+    const pageIdx = @divFloor(idx, TAB_ROWS_PER_PAGE);
+
+    std.debug.print("TEST {any}\n", .{pages[pageIdx]});
 }
