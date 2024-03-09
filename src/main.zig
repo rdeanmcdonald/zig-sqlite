@@ -39,17 +39,23 @@ const Table = struct {
         }
 
         const pageIdx = @divFloor(self.nextAvailableRowIdx, TAB_ROWS_PER_PAGE);
-        if (self.pages[pageIdx] == null) {
-            self.pages[pageIdx] = try self.allocator.create(Page);
+        if (self.pages[pageIdx]) |page| {
+            try self.writeRowData(row, page);
+        } else {
+            const page = try self.allocator.create(Page);
+            self.pages[pageIdx] = page;
+            try self.writeRowData(row, page);
         }
+    }
 
-        var pageData = self.pages[pageIdx].?.data;
-        const rowSlice = pageData[self.nextAvailableRowIdx .. self.nextAvailableRowIdx + ROW_SIZE];
+    fn writeRowData(self: *Self, row: *Row, page: *Page) !void {
+        const rowOffset = self.nextAvailableRowIdx * ROW_SIZE;
+        const rowSlice = page.data[rowOffset .. rowOffset + ROW_SIZE];
 
         row.serializeToSlice(rowSlice);
         self.nextAvailableRowIdx += 1;
 
-        std.debug.print("PAGE DATA {any}\n", .{pageData});
+        std.debug.print("PAGE DATA {any}\n", .{page.data});
     }
 };
 
