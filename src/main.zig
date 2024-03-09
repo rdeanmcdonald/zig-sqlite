@@ -38,7 +38,7 @@ const Table = struct {
             return error.TableFull;
         }
 
-        const pageIdx = @divFloor(self.nextAvailableRowIdx, TAB_ROWS_PER_PAGE);
+        const pageIdx = self.getPageIdxFromRowIdx(self.nextAvailableRowIdx);
         if (self.pages[pageIdx]) |page| {
             try self.writeRowData(row, page);
         } else {
@@ -48,14 +48,33 @@ const Table = struct {
         }
     }
 
+    fn getPageIdxFromRowIdx(_: *Self, rowIdx: u32) u32 {
+        return @divFloor(rowIdx, TAB_ROWS_PER_PAGE);
+    }
+    
+    fn getRowSliceFromIdx(_: *Self, idx: u32, page: *Page) []u8 {
+        const rowOffset = idx * ROW_SIZE;
+        return page.data[rowOffset .. rowOffset + ROW_SIZE];
+    }
+
     fn writeRowData(self: *Self, row: *Row, page: *Page) !void {
-        const rowOffset = self.nextAvailableRowIdx * ROW_SIZE;
-        const rowSlice = page.data[rowOffset .. rowOffset + ROW_SIZE];
+        const rowSlice = self.getRowSliceFromIdx(self.nextAvailableRowIdx, page);
 
         row.serializeToSlice(rowSlice);
         self.nextAvailableRowIdx += 1;
 
         std.debug.print("PAGE DATA {any}\n", .{page.data});
+    }
+
+    /// Caller is responsible for freeing rows.
+    pub fn readRow(self: *Self, idx: u32) !?*Row {
+        const pageIdx = self.getPageIdxFromRowIdx(idx);
+        if (self.pages[pageIdx]) |page| {
+            const rowSlice = self.getRowSliceFromIdx(idx, page);
+            return try Row.initFromSerializedSlice(rowSlice, self.allocator);
+        } else {
+            return null;
+        }
     }
 };
 
@@ -131,10 +150,6 @@ const Insert = struct {
 
     pub fn init(idBytes: []const u8, usernameBytes: []const u8, emailBytes: []const u8, allocator: *Allocator) !Self {
         const row = try Row.initFromString(idBytes, usernameBytes, emailBytes, allocator);
-        // var dest: [ROW_SIZE]u8 = undefined;
-        // row.serializeToSlice(dest[0..]);
-        // const newRow = try Row.initFromSerializedSlice(dest[0..], allocator);
-        // std.debug.print("newRow {any}\n", .{newRow});
 
         return Self{ .row = row };
     }
@@ -145,8 +160,10 @@ const Select = struct {
 
     pub fn exec(self: Self, table: *Table) !void {
         _ = self;
-        _ = table;
-        std.debug.print("SELECTING\n", .{});
+        for (0..table.nextAvailableRowIdx) |i| {
+            const row = try table.readRow(@intCast(i));
+            std.debug.print("ROW IDX: {d}, ID: {d}, USERNAME: {s}, EMAIL: {s}\n", .{ i, row.?.id, row.?.username, row.?.email });
+        }
     }
 
     pub fn init() Self {
