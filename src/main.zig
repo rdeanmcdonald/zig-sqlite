@@ -51,7 +51,7 @@ const Table = struct {
     fn getPageIdxFromRowIdx(_: *Self, rowIdx: u32) u32 {
         return @divFloor(rowIdx, TAB_ROWS_PER_PAGE);
     }
-    
+
     fn getRowSliceFromIdx(_: *Self, idx: u32, page: *Page) []u8 {
         const rowOffset = idx * ROW_SIZE;
         return page.data[rowOffset .. rowOffset + ROW_SIZE];
@@ -67,13 +67,14 @@ const Table = struct {
     }
 
     /// Caller is responsible for freeing rows.
-    pub fn readRow(self: *Self, idx: u32) !?*Row {
+    pub fn readRow(self: *Self, idx: u32, row: *Row) bool {
         const pageIdx = self.getPageIdxFromRowIdx(idx);
         if (self.pages[pageIdx]) |page| {
             const rowSlice = self.getRowSliceFromIdx(idx, page);
-            return try Row.initFromSerializedSlice(rowSlice, self.allocator);
+            Row.deserializeFromSlice(row, rowSlice);
+            return true;
         } else {
-            return null;
+            return false;
         }
     }
 };
@@ -94,7 +95,11 @@ const Row = struct {
     username: [USERNAME_SIZE]u8,
     email: [EMAIL_SIZE]u8,
 
-    pub fn initFromString(idStr: []const u8, usernameStr: []const u8, emailStr: []const u8, allocator: *Allocator) !*Self {
+    pub fn initEmpty(allocator: *Allocator) !*Self {
+        return try Row.initFromUtf8("0", "", "", allocator);
+    }
+
+    pub fn initFromUtf8(idStr: []const u8, usernameStr: []const u8, emailStr: []const u8, allocator: *Allocator) !*Self {
         const id = try std.fmt.parseInt(u32, idStr, 10);
 
         const idBytes = try allocator.alloc(u8, ID_SIZE);
@@ -106,17 +111,19 @@ const Row = struct {
     }
 
     pub fn initFromBytes(idBytes: []const u8, usernameBytes: []const u8, emailBytes: []const u8, allocator: *Allocator) !*Self {
+        var row = try allocator.create(Row);
+        row.fillFromBytes(idBytes, usernameBytes, emailBytes);
+        return row;
+    }
+
+    fn fillFromBytes(self: *Self, idBytes: []const u8, usernameBytes: []const u8, emailBytes: []const u8) void {
         assert(idBytes.len == ID_SIZE);
         assert(usernameBytes.len <= USERNAME_SIZE);
         assert(emailBytes.len <= EMAIL_SIZE);
 
-        var row = try allocator.create(Row);
-
-        row.id = mem.readPackedIntNative(u32, idBytes, 0);
-        mem.copyForwards(u8, row.username[0..], usernameBytes);
-        mem.copyForwards(u8, row.email[0..], emailBytes);
-
-        return row;
+        self.id = mem.readPackedIntNative(u32, idBytes, 0);
+        mem.copyForwards(u8, self.username[0..], usernameBytes);
+        mem.copyForwards(u8, self.email[0..], emailBytes);
     }
 
     /// Write Row bytes to dest slice
@@ -127,14 +134,14 @@ const Row = struct {
         mem.copyForwards(u8, dest[EMAIL_OFF .. EMAIL_OFF + EMAIL_SIZE], self.email[0..]);
     }
 
-    /// Initialize a Row from a previously serialized Row
-    pub fn initFromSerializedSlice(src: []u8, allocator: *Allocator) !*Self {
+    /// Read in a Row from a previously serialized Row
+    pub fn deserializeFromSlice(self: *Self, src: []u8) void {
         assert(src.len >= ROW_SIZE);
         const idSlice = src[ID_OFF .. ID_OFF + ID_SIZE];
         const usernameSlice = src[USERNAME_OFF .. USERNAME_OFF + USERNAME_SIZE];
         const emailSlice = src[EMAIL_OFF .. EMAIL_OFF + EMAIL_SIZE];
 
-        return Row.initFromBytes(idSlice, usernameSlice, emailSlice, allocator);
+        return self.fillFromBytes(idSlice, usernameSlice, emailSlice);
     }
 };
 
@@ -149,7 +156,7 @@ const Insert = struct {
     }
 
     pub fn init(idBytes: []const u8, usernameBytes: []const u8, emailBytes: []const u8, allocator: *Allocator) !Self {
-        const row = try Row.initFromString(idBytes, usernameBytes, emailBytes, allocator);
+        const row = try Row.initFromUtf8(idBytes, usernameBytes, emailBytes, allocator);
 
         return Self{ .row = row };
     }
@@ -158,16 +165,20 @@ const Insert = struct {
 const Select = struct {
     const Self = @This();
 
+    allocator: *Allocator,
+
     pub fn exec(self: Self, table: *Table) !void {
-        _ = self;
+        const row = try Row.initEmpty(self.allocator);
         for (0..table.nextAvailableRowIdx) |i| {
-            const row = try table.readRow(@intCast(i));
-            std.debug.print("ROW IDX: {d}, ID: {d}, USERNAME: {s}, EMAIL: {s}\n", .{ i, row.?.id, row.?.username, row.?.email });
+            const validRead = table.readRow(@intCast(i), row);
+            if (validRead) {
+                std.debug.print("ROW IDX: {d}, ID: {d}, USERNAME: {s}, EMAIL: {s}\n", .{ i, row.id, row.username, row.email });
+            }
         }
     }
 
-    pub fn init() Self {
-        return Self{};
+    pub fn init(allocator: *Allocator) Self {
+        return Self{.allocator = allocator};
     }
 };
 
@@ -194,7 +205,7 @@ const Statement = union(enum) {
         }
 
         if (mem.eql(u8, cmd, "select")) {
-            const impl = Select.init();
+            const impl = Select.init(allocator);
             return Self{
                 .select = impl,
             };
