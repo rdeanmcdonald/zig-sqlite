@@ -4,16 +4,24 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const stdin = std.io.getStdIn().reader();
 const stdout = std.io.getStdOut().writer();
-const assert = std.debug.assert;
 
 const DbError = error{ General, InvalidInput, TableFull };
 const MetaCmdRes = enum { META_CMD_SUCCESS, META_CMD_UNRECOGNIZED };
 const StatementType = enum { STATEMENT_INSERT, STATEMENT_SELECT };
 
+fn assert(ok: bool, err: DbError) !void {
+    if (!ok) {
+        return err;
+    }
+}
+
+
 const TAB_PAGE_SIZE = 4096;
 const TAB_MAX_PAGES = 100;
 const TAB_ROWS_PER_PAGE = TAB_PAGE_SIZE / ROW_SIZE;
 const TAB_MAX_ROWS = TAB_ROWS_PER_PAGE * TAB_MAX_PAGES;
+
+
 
 const Table = struct {
     const Self = @This();
@@ -38,18 +46,20 @@ const Table = struct {
             return error.TableFull;
         }
 
-        const pageIdx = self.getPageIdxFromRowIdx(self.nextAvailableRowIdx);
+        const rowIdxOnPage, const pageIdx = self.getIdxsFromRowIdx(self.nextAvailableRowIdx);
         if (self.pages[pageIdx]) |page| {
-            try self.writeRowData(row, page);
+            try self.writeRowData(rowIdxOnPage, row, page);
         } else {
             const page = try self.allocator.create(Page);
             self.pages[pageIdx] = page;
-            try self.writeRowData(row, page);
+            try self.writeRowData(rowIdxOnPage, row, page);
         }
     }
 
-    fn getPageIdxFromRowIdx(_: *Self, rowIdx: u32) u32 {
-        return @divFloor(rowIdx, TAB_ROWS_PER_PAGE);
+    /// .{rowIdxInPage, pageIdx}
+    fn getIdxsFromRowIdx(_: *Self, rowIdx: u32) [2]u32 {
+        const mod = @mod(rowIdx, TAB_ROWS_PER_PAGE);
+        return .{mod, @divFloor(rowIdx, TAB_ROWS_PER_PAGE)};
     }
 
     fn getRowSliceFromIdx(_: *Self, idx: u32, page: *Page) []u8 {
@@ -57,21 +67,20 @@ const Table = struct {
         return page.data[rowOffset .. rowOffset + ROW_SIZE];
     }
 
-    fn writeRowData(self: *Self, row: *Row, page: *Page) !void {
-        const rowSlice = self.getRowSliceFromIdx(self.nextAvailableRowIdx, page);
+    fn writeRowData(self: *Self, rowIdxOnPage: u32, row: *Row, page: *Page) !void {
+        const rowSlice = self.getRowSliceFromIdx(rowIdxOnPage, page);
 
-        row.serializeToSlice(rowSlice);
+        try row.serializeToSlice(rowSlice);
         self.nextAvailableRowIdx += 1;
 
         std.debug.print("PAGE DATA {any}\n", .{page.data});
     }
 
-    /// Caller is responsible for freeing rows.
-    pub fn readRow(self: *Self, idx: u32, row: *Row) bool {
-        const pageIdx = self.getPageIdxFromRowIdx(idx);
+    pub fn readRow(self: *Self, idx: u32, row: *Row) !bool {
+        const rowIdxOnPage, const pageIdx = self.getIdxsFromRowIdx(idx);
         if (self.pages[pageIdx]) |page| {
-            const rowSlice = self.getRowSliceFromIdx(idx, page);
-            Row.deserializeFromSlice(row, rowSlice);
+            const rowSlice = self.getRowSliceFromIdx(rowIdxOnPage, page);
+            try Row.deserializeFromSlice(row, rowSlice);
             return true;
         } else {
             return false;
@@ -112,14 +121,14 @@ const Row = struct {
 
     pub fn initFromBytes(idBytes: []const u8, usernameBytes: []const u8, emailBytes: []const u8, allocator: *Allocator) !*Self {
         var row = try allocator.create(Row);
-        row.fillFromBytes(idBytes, usernameBytes, emailBytes);
+        try row.fillFromBytes(idBytes, usernameBytes, emailBytes);
         return row;
     }
 
-    fn fillFromBytes(self: *Self, idBytes: []const u8, usernameBytes: []const u8, emailBytes: []const u8) void {
-        assert(idBytes.len == ID_SIZE);
-        assert(usernameBytes.len <= USERNAME_SIZE);
-        assert(emailBytes.len <= EMAIL_SIZE);
+    fn fillFromBytes(self: *Self, idBytes: []const u8, usernameBytes: []const u8, emailBytes: []const u8) !void {
+        try assert(idBytes.len == ID_SIZE, DbError.InvalidInput);
+        try assert(usernameBytes.len <= USERNAME_SIZE, DbError.InvalidInput);
+        try assert(emailBytes.len <= EMAIL_SIZE, DbError.InvalidInput);
 
         self.id = mem.readPackedIntNative(u32, idBytes, 0);
         mem.copyForwards(u8, self.username[0..], usernameBytes);
@@ -127,21 +136,21 @@ const Row = struct {
     }
 
     /// Write Row bytes to dest slice
-    pub fn serializeToSlice(self: Self, dest: []u8) void {
-        assert(dest.len >= ROW_SIZE);
+    pub fn serializeToSlice(self: Self, dest: []u8) !void {
+        try assert(dest.len >= ROW_SIZE, DbError.General);
         mem.writePackedIntNative(@TypeOf(self.id), dest[ID_OFF .. ID_OFF + ID_SIZE], 0, self.id);
         mem.copyForwards(u8, dest[USERNAME_OFF .. USERNAME_OFF + USERNAME_SIZE], self.username[0..]);
         mem.copyForwards(u8, dest[EMAIL_OFF .. EMAIL_OFF + EMAIL_SIZE], self.email[0..]);
     }
 
     /// Read in a Row from a previously serialized Row
-    pub fn deserializeFromSlice(self: *Self, src: []u8) void {
-        assert(src.len >= ROW_SIZE);
+    pub fn deserializeFromSlice(self: *Self, src: []u8) !void {
+        try assert(src.len >= ROW_SIZE, DbError.General);
         const idSlice = src[ID_OFF .. ID_OFF + ID_SIZE];
         const usernameSlice = src[USERNAME_OFF .. USERNAME_OFF + USERNAME_SIZE];
         const emailSlice = src[EMAIL_OFF .. EMAIL_OFF + EMAIL_SIZE];
 
-        return self.fillFromBytes(idSlice, usernameSlice, emailSlice);
+        return try self.fillFromBytes(idSlice, usernameSlice, emailSlice);
     }
 };
 
@@ -170,7 +179,7 @@ const Select = struct {
     pub fn exec(self: Self, table: *Table) !void {
         const row = try Row.initEmpty(self.allocator);
         for (0..table.nextAvailableRowIdx) |i| {
-            const validRead = table.readRow(@intCast(i), row);
+            const validRead = try table.readRow(@intCast(i), row);
             if (validRead) {
                 std.debug.print("ROW IDX: {d}, ID: {d}, USERNAME: {s}, EMAIL: {s}\n", .{ i, row.id, row.username, row.email });
             }
@@ -178,7 +187,7 @@ const Select = struct {
     }
 
     pub fn init(allocator: *Allocator) Self {
-        return Self{.allocator = allocator};
+        return Self{ .allocator = allocator };
     }
 };
 
@@ -280,7 +289,7 @@ pub fn main() !void {
         try inbuf.read();
         if (inbuf.startsWith(".")) {
             if (doMetaCmd(&inbuf)) |_| {} else |_| {
-                std.debug.print("Unrecognized meta command: {s}\n", .{inbuf.getInput()});
+                std.debug.print("Unrecognized meta command: <<<{s}>>>\n", .{inbuf.getInput()});
             }
             continue;
         }
@@ -288,12 +297,12 @@ pub fn main() !void {
             var statement = s;
             try statement.exec(&table);
         } else |err| {
-            std.debug.print("ERROR ENCOUNTERED: {any} \nFOR INPUT {s}\n", .{ err, inbuf.getInput() });
+            std.debug.print("ERROR <<<{any}>>> FOR INPUT <<<{s}>>>\n", .{ err, inbuf.getInput() });
         }
     }
 }
 
-test "simple test" {
+test "inserts and selects rows" {
     const idx: u32 = 14;
     const pages: [TAB_MAX_PAGES]?usize = undefined;
     const pageIdx = @divFloor(idx, TAB_ROWS_PER_PAGE);
