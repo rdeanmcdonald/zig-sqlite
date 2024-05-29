@@ -25,17 +25,62 @@ const ID_OFF = 0;
 const USERNAME_OFF = ID_OFF + ID_SIZE;
 const EMAIL_OFF = USERNAME_OFF + USERNAME_SIZE;
 
+const Io = union(enum) {
+    const Self = @This();
+
+    cli: Cli,
+    testing: Cli,
+
+    pub fn print(self: *Self, comptime format: []const u8, args: anytype) !void {
+        switch (self.*) {
+            inline else => |*io| try io.print(format, args),
+        }
+    }
+
+    pub fn flush(self: *Self) !void {
+        switch (self.*) {
+            inline else => |*io| try io.flush(),
+        }
+    }
+
+    pub fn readUntilDelimiterOrEof(
+        self: *Self,
+        buf: []u8,
+        delimiter: u8,
+    ) !?[]u8 {
+        switch (self.*) {
+            inline else => |*io| return io.readUntilDelimiterOrEof(buf, delimiter),
+        }
+    }
+};
+
 const Cli = struct {
     const Self = @This();
 
-    reader:  std.io.BufferedReader(4096, std.fs.File.Reader),
-    writer:  std.io.BufferedWriter(4096, std.fs.File.Writer),
+    reader: std.io.BufferedReader(4096, std.fs.File.Reader),
+    writer: std.io.BufferedWriter(4096, std.fs.File.Writer),
 
     pub fn init(r: std.fs.File.Reader, w: std.fs.File.Writer) Self {
         return .{
             .reader = std.io.bufferedReader(r),
             .writer = std.io.bufferedWriter(w),
         };
+    }
+
+    pub fn print(self: *Self, comptime format: []const u8, args: anytype) !void {
+        try self.writer.writer().print(format, args);
+    }
+
+    pub fn flush(self: *Self) !void {
+        try self.writer.flush();
+    }
+
+    pub fn readUntilDelimiterOrEof(
+        self: *Self,
+        buf: []u8,
+        delimiter: u8,
+    ) !?[]u8 {
+        return try self.reader.reader().readUntilDelimiterOrEof(buf, delimiter);
     }
 };
 
@@ -159,15 +204,15 @@ const Insert = struct {
     const Self = @This();
 
     row: *Row,
-    cli: *Cli,
+    io: *Io,
 
     pub fn exec(self: Self, table: *Table) !void {
         try table.insertRow(self.row);
-        try self.cli.writer.writer().print("INSERTED {d}, {s}, {s}\n", .{ self.row.id, self.row.username, self.row.email });
+        try self.io.print("INSERTED {d}, {s}, {s}\n", .{ self.row.id, self.row.username, self.row.email });
     }
 
-    pub fn init(idUtf8: []const u8, usernameUtf8: []const u8, emailUtf8: []const u8, arena: *Allocator, cli: *Cli) !Self {
-        return Self{ .row = try Row.initFromUtf8(idUtf8, usernameUtf8, emailUtf8, arena), .cli = cli };
+    pub fn init(idUtf8: []const u8, usernameUtf8: []const u8, emailUtf8: []const u8, arena: *Allocator, io: *Io) !Self {
+        return Self{ .row = try Row.initFromUtf8(idUtf8, usernameUtf8, emailUtf8, arena), .io = io };
     }
 };
 
@@ -175,20 +220,20 @@ const Select = struct {
     const Self = @This();
 
     arena: *Allocator,
-    cli: *Cli,
+    io: *Io,
 
     pub fn exec(self: Self, table: *Table) !void {
         const row = try Row.init(self.arena);
         for (0..table.nextAvailableRowIdx) |i| {
             const validRead = try table.readRow(@intCast(i), row);
             if (validRead) {
-                try self.cli.writer.writer().print("ROW IDX: {d}, ID: {d}, USERNAME: {s}, EMAIL: {s}\n", .{ i, row.id, row.username, row.email });
+                try self.io.print("ROW IDX: {d}, ID: {d}, USERNAME: {s}, EMAIL: {s}\n", .{ i, row.id, row.username, row.email });
             }
         }
     }
 
-    pub fn init(arena: *Allocator, cli: *Cli) Self {
-        return Self{ .arena = arena, .cli = cli };
+    pub fn init(arena: *Allocator, io: *Io) Self {
+        return Self{ .arena = arena, .io = io };
     }
 };
 
@@ -200,7 +245,7 @@ const Statement = union(enum) {
     insert: Insert,
     select: Select,
 
-    pub fn init(inbuf: *InputBuf, arena: *Allocator, cli: *Cli) !Self {
+    pub fn init(inbuf: *InputBuf, arena: *Allocator, io: *Io) !Self {
         var tokens = mem.splitScalar(u8, inbuf.getInput(), ' ');
 
         const cmd = tokens.next() orelse return DbError.InvalidInput;
@@ -208,14 +253,14 @@ const Statement = union(enum) {
             const id = tokens.next() orelse return DbError.InvalidInput;
             const username = tokens.next() orelse return DbError.InvalidInput;
             const email = tokens.next() orelse return DbError.InvalidInput;
-            const insert = try Insert.init(id, username, email, arena, cli);
+            const insert = try Insert.init(id, username, email, arena, io);
             return Self{
                 .insert = insert,
             };
         }
 
         if (mem.eql(u8, cmd, "select")) {
-            const select = Select.init(arena, cli);
+            const select = Select.init(arena, io);
             return Self{
                 .select = select,
             };
@@ -243,23 +288,23 @@ const InputBuf = struct {
     buf: []u8,
     inlen: usize,
     allocator: *Allocator,
-    cli: *Cli,
+    io: *Io,
 
     const Self = @This();
 
-    pub fn init(allocator: *Allocator, cli: *Cli) !Self {
+    pub fn init(allocator: *Allocator, io: *Io) !Self {
         const buflen = 4096;
         const buf = try allocator.alloc(u8, buflen);
         return Self{
             .buf = buf,
             .inlen = 0,
             .allocator = allocator,
-            .cli = cli,
+            .io = io,
         };
     }
 
     pub fn read(self: *Self) !void {
-        if (try self.cli.reader.reader().readUntilDelimiterOrEof(self.buf, '\n')) |in| {
+        if (try self.io.readUntilDelimiterOrEof(self.buf, '\n')) |in| {
             self.inlen = in.len;
         } else {
             return DbError.InvalidInput;
@@ -279,17 +324,15 @@ const InputBuf = struct {
     }
 };
 
-fn printPrompt(cli: *Cli) !void {
-    try cli.writer.writer().print("db > ", .{});
+fn printPromptAndFlush(io: *Io) !void {
+    try io.print("db > ", .{});
+    try io.flush();
 }
 
-pub fn main() !void {
+pub fn runDb(io: *Io) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     var allocator = gpa.allocator();
-    const stdin = std.io.getStdIn();
-    const stdout = std.io.getStdOut();
-    var cli = Cli.init(stdin.reader(), stdout.writer());
-    var inbuf = try InputBuf.init(&allocator, &cli);
+    var inbuf = try InputBuf.init(&allocator, io);
     var table = Table.init(&allocator);
     while (true) {
         // statement allocations are alloc/freed once per exec, all statement
@@ -299,21 +342,28 @@ pub fn main() !void {
 
         var arena = statementAllocator.allocator();
 
-        try printPrompt(&cli);
-        try cli.writer.flush();
+        try printPromptAndFlush(io);
         try inbuf.read();
         if (inbuf.startsWith(".")) {
             if (doMetaCmd(&inbuf)) |_| {} else |_| {
-                try cli.writer.writer().print("Unrecognized meta command: <<<{s}>>>\n", .{inbuf.getInput()});
+                try io.print("Unrecognized meta command: <<<{s}>>>\n", .{inbuf.getInput()});
             }
             continue;
         }
-        if (Statement.init(&inbuf, &arena, &cli)) |s| {
+        if (Statement.init(&inbuf, &arena, io)) |s| {
             try s.exec(&table);
         } else |err| {
-            try cli.writer.writer().print("ERROR <<<{any}>>> FOR INPUT <<<{s}>>>\n", .{ err, inbuf.getInput() });
+            try io.print("ERROR <<<{any}>>> FOR INPUT <<<{s}>>>\n", .{ err, inbuf.getInput() });
         }
     }
+}
+
+pub fn main() !void {
+    const stdin = std.io.getStdIn();
+    const stdout = std.io.getStdOut();
+    const cli = Cli.init(stdin.reader(), stdout.writer());
+    var io = Io{ .cli = cli };
+    try runDb(&io);
 }
 
 test "inserts and selects rows" {
