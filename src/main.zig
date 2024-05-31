@@ -25,13 +25,15 @@ const ID_OFF = 0;
 const USERNAME_OFF = ID_OFF + ID_SIZE;
 const EMAIL_OFF = USERNAME_OFF + USERNAME_SIZE;
 
+const Reader = std.io.StreamSource.Reader;
+const Writer = std.io.StreamSource.Writer;
 const Cli = struct {
     const Self = @This();
 
-    reader: std.io.BufferedReader(4096, std.fs.File.Reader),
-    writer: std.io.BufferedWriter(4096, std.fs.File.Writer),
+    reader: std.io.BufferedReader(4096, Reader),
+    writer: std.io.BufferedWriter(4096, Writer),
 
-    pub fn init(r: std.fs.File.Reader, w: std.fs.File.Writer) Self {
+    pub fn init(r: Reader, w: Writer) Self {
         return .{
             .reader = std.io.bufferedReader(r),
             .writer = std.io.bufferedWriter(w),
@@ -259,11 +261,9 @@ const InputBuf = struct {
     }
 
     pub fn read(self: *Self) !void {
-        if (try self.cli.reader.reader().readUntilDelimiterOrEof(self.buf, '\n')) |in| {
-            self.inlen = in.len;
-        } else {
-            return DbError.InvalidInput;
-        }
+        var fbs = std.io.fixedBufferStream(self.buf);
+        try self.cli.reader.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
+        self.inlen = fbs.getWritten().len;
     }
 
     pub fn getInput(self: *Self) []u8 {
@@ -314,16 +314,33 @@ pub fn runDb(cli: *Cli) !void {
 }
 
 pub fn main() !void {
-    const stdin = std.io.getStdIn();
-    const stdout = std.io.getStdOut();
-    var cli = Cli.init(stdin.reader(), stdout.writer());
+    var inStream = std.io.StreamSource{ .file = std.io.getStdIn() };
+    var outStream = std.io.StreamSource{ .file = std.io.getStdOut() };
+    var cli = Cli.init(inStream.reader(), outStream.writer());
     try runDb(&cli);
 }
 
 test "inserts, selects, and exits for large number of rows" {
-    const idx: u32 = 14;
-    const pages: [TAB_MAX_PAGES]?usize = undefined;
-    const pageIdx = @divFloor(idx, TAB_ROWS_PER_PAGE);
+    var inBuf: [4096]u8 = undefined;
+    var outBuf: [4096]u8 = undefined;
+    var inStream = std.io.StreamSource{ .buffer = std.io.fixedBufferStream(&inBuf) };
+    var outStream = std.io.StreamSource{ .buffer = std.io.fixedBufferStream(&outBuf) };
 
-    std.debug.print("TEST {any}\n", .{pages[pageIdx]});
+    var cli = Cli.init(inStream.reader(), outStream.writer());
+    // Fork the process, and run the db in the child
+    const fork_pid = try std.posix.fork();
+    if (fork_pid == 0) {
+        // Child process
+        try runDb(&cli);
+    } else {
+        // Parent process
+        var buf: [4096]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(buf[0..]);
+        const correctAnswer = "INSERTED 1, a, a";
+        try inStream.writer().print("insert 1 a a\n", .{});
+        try outStream.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
+        const answer = fbs.getWritten();
+        std.log.warn("ANSWER: {any}\n", .{answer});
+        try std.testing.expectEqual(answer, correctAnswer[0..]);
+    }
 }
