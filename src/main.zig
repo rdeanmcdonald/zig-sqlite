@@ -17,16 +17,23 @@ const TAB_PAGE_SIZE = 4096;
 const TAB_MAX_PAGES = 100;
 const TAB_ROWS_PER_PAGE = TAB_PAGE_SIZE / ROW_SIZE;
 const TAB_MAX_ROWS = TAB_ROWS_PER_PAGE * TAB_MAX_PAGES;
+
 const ID_SIZE = @sizeOf(u32);
 const USERNAME_SIZE = 32;
+const USERNAME_LEN_SIZE = 1;
 const EMAIL_SIZE = 255;
-const ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
+const EMAIL_LEN_SIZE = 1;
+const ROW_SIZE = ID_SIZE + USERNAME_LEN_SIZE + USERNAME_SIZE + EMAIL_LEN_SIZE + EMAIL_SIZE;
+
 const ID_OFF = 0;
-const USERNAME_OFF = ID_OFF + ID_SIZE;
-const EMAIL_OFF = USERNAME_OFF + USERNAME_SIZE;
+const USERNAME_LEN_OFF = ID_OFF + ID_SIZE;
+const USERNAME_OFF = USERNAME_LEN_OFF + USERNAME_LEN_SIZE;
+const EMAIL_LEN_OFF = USERNAME_OFF + USERNAME_SIZE;
+const EMAIL_OFF = EMAIL_LEN_OFF + EMAIL_LEN_SIZE;
 
 const Reader = std.io.StreamSource.Reader;
 const Writer = std.io.StreamSource.Writer;
+
 const Cli = struct {
     const Self = @This();
 
@@ -110,7 +117,9 @@ const Row = struct {
 
     id: u32,
     username: [USERNAME_SIZE]u8,
+    username_len: u8, // username can't be > 32 bits
     email: [EMAIL_SIZE]u8,
+    email_len: u8, // email can't be > 255 bits
 
     pub fn init(allocator: *Allocator) !*Self {
         return try allocator.create(Row);
@@ -122,8 +131,14 @@ const Row = struct {
         var idBytes: [ID_SIZE]u8 = .{ 0, 0, 0, 0 };
         mem.writePackedIntNative(u32, idBytes[0..], 0, id);
 
+        var usernameLenBytes: [USERNAME_LEN_SIZE]u8 = .{0};
+        mem.writePackedIntNative(u8, usernameLenBytes[0..], 0, @intCast(usernameUtf8.len));
+
+        var emailLenBytes: [EMAIL_LEN_SIZE]u8 = .{0};
+        mem.writePackedIntNative(u8, emailLenBytes[0..], 0, @intCast(emailUtf8.len));
+
         const row = try Row.init(allocator);
-        try row.fillFromBytes(idBytes[0..], usernameUtf8, emailUtf8);
+        try row.fillFromBytes(idBytes[0..], usernameLenBytes[0..], usernameUtf8, emailLenBytes[0..], emailUtf8);
 
         return row;
     }
@@ -132,7 +147,9 @@ const Row = struct {
     pub fn serializeToSlice(self: *Self, dest: []u8) !void {
         try assert(dest.len >= ROW_SIZE, DbError.General);
         mem.writePackedIntNative(@TypeOf(self.id), dest[ID_OFF .. ID_OFF + ID_SIZE], 0, self.id);
+        mem.writePackedIntNative(@TypeOf(self.username_len), dest[USERNAME_LEN_OFF .. USERNAME_LEN_OFF + USERNAME_LEN_SIZE], 0, self.username_len);
         mem.copyForwards(u8, dest[USERNAME_OFF .. USERNAME_OFF + USERNAME_SIZE], self.username[0..]);
+        mem.writePackedIntNative(@TypeOf(self.email_len), dest[EMAIL_LEN_OFF .. EMAIL_LEN_OFF + EMAIL_LEN_SIZE], 0, self.email_len);
         mem.copyForwards(u8, dest[EMAIL_OFF .. EMAIL_OFF + EMAIL_SIZE], self.email[0..]);
     }
 
@@ -140,18 +157,22 @@ const Row = struct {
     pub fn deserializeFromSlice(self: *Self, src: []u8) !void {
         try assert(src.len >= ROW_SIZE, DbError.General);
         const idSlice = src[ID_OFF .. ID_OFF + ID_SIZE];
+        const usernameLenSlice = src[USERNAME_LEN_OFF .. USERNAME_LEN_OFF + USERNAME_LEN_SIZE];
         const usernameSlice = src[USERNAME_OFF .. USERNAME_OFF + USERNAME_SIZE];
+        const emailLenSlice = src[EMAIL_LEN_OFF .. EMAIL_LEN_OFF + EMAIL_LEN_SIZE];
         const emailSlice = src[EMAIL_OFF .. EMAIL_OFF + EMAIL_SIZE];
 
-        return try self.fillFromBytes(idSlice, usernameSlice, emailSlice);
+        return try self.fillFromBytes(idSlice, usernameLenSlice, usernameSlice, emailLenSlice, emailSlice);
     }
 
-    fn fillFromBytes(self: *Self, idBytes: []const u8, usernameBytes: []const u8, emailBytes: []const u8) !void {
+    fn fillFromBytes(self: *Self, idBytes: []const u8, usernameLenBytes: []const u8, usernameBytes: []const u8, emailLenBytes: []const u8, emailBytes: []const u8) !void {
         try assert(idBytes.len == ID_SIZE, DbError.InvalidInput);
         try assert(usernameBytes.len <= USERNAME_SIZE, DbError.InvalidInput);
         try assert(emailBytes.len <= EMAIL_SIZE, DbError.InvalidInput);
 
         self.id = mem.readPackedIntNative(u32, idBytes, 0);
+        self.username_len = mem.readPackedIntNative(u8, usernameLenBytes, 0);
+        self.email_len = mem.readPackedIntNative(u8, emailLenBytes, 0);
         mem.copyForwards(u8, self.username[0..], usernameBytes);
         mem.copyForwards(u8, self.email[0..], emailBytes);
     }
@@ -165,7 +186,7 @@ const Insert = struct {
 
     pub fn exec(self: Self, table: *Table) !void {
         try table.insertRow(self.row);
-        try self.cli.writer.writer().print("INSERTED {d}, {s}, {s}\n", .{ self.row.id, self.row.username, self.row.email });
+        try self.cli.writer.writer().print("INSERTED {d}, {s}, {s}\n", .{ self.row.id, self.row.username[0..self.row.username_len], self.row.email[0..self.row.email_len] });
     }
 
     pub fn init(idUtf8: []const u8, usernameUtf8: []const u8, emailUtf8: []const u8, arena: *Allocator, cli: *Cli) !Self {
@@ -184,7 +205,7 @@ const Select = struct {
         for (0..table.nextAvailableRowIdx) |i| {
             const validRead = try table.readRow(@intCast(i), row);
             if (validRead) {
-                try self.cli.writer.writer().print("ROW IDX: {d}, ID: {d}, USERNAME: {s}, EMAIL: {s}\n", .{ i, row.id, row.username, row.email });
+                try self.cli.writer.writer().print("ROW IDX: {d}, ID: {d}, USERNAME: {s}, EMAIL: {s}\n", .{ i, row.id, row.username[0..row.username_len], row.email[0..row.email_len] });
             }
         }
     }
@@ -321,12 +342,15 @@ pub fn main() !void {
 }
 
 test "inserts, selects, and exits for large number of rows" {
-    var inBuf: [4096]u8 = undefined;
-    var outBuf: [4096]u8 = undefined;
-    var inStream = std.io.StreamSource{ .buffer = std.io.fixedBufferStream(&inBuf) };
-    var outStream = std.io.StreamSource{ .buffer = std.io.fixedBufferStream(&outBuf) };
+    const inPipeReadEnd, const inPipeWriteEnd = try std.posix.pipe();
+    const outPipeReadEnd, const outPipeWriteEnd = try std.posix.pipe();
+    var cliInStream = std.io.StreamSource{ .file = std.fs.File{ .handle = inPipeReadEnd } };
+    var cliOutStream = std.io.StreamSource{ .file = std.fs.File{ .handle = outPipeWriteEnd } };
+    var userInputStream = std.io.StreamSource{ .file = std.fs.File{ .handle = inPipeWriteEnd } };
+    var dbOutputStream = std.io.StreamSource{ .file = std.fs.File{ .handle = outPipeReadEnd } };
 
-    var cli = Cli.init(inStream.reader(), outStream.writer());
+    var cli = Cli.init(cliInStream.reader(), cliOutStream.writer());
+
     // Fork the process, and run the db in the child
     const fork_pid = try std.posix.fork();
     if (fork_pid == 0) {
@@ -336,11 +360,36 @@ test "inserts, selects, and exits for large number of rows" {
         // Parent process
         var buf: [4096]u8 = undefined;
         var fbs = std.io.fixedBufferStream(buf[0..]);
-        const correctAnswer = "INSERTED 1, a, a";
-        try inStream.writer().print("insert 1 a a\n", .{});
-        try outStream.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
-        const answer = fbs.getWritten();
-        std.log.warn("ANSWER: {any}\n", .{answer});
-        try std.testing.expectEqual(answer, correctAnswer[0..]);
+        const usersToInsert: [1000]u32 = undefined;
+
+        // insert all the users
+        for (usersToInsert, 0..) |_, i| {
+            try userInputStream.writer().print("insert {d} someusername some@email.com\n", .{i});
+            try dbOutputStream.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
+            const answer = fbs.getWritten();
+            fbs.reset();
+
+            try std.fmt.format(fbs.writer(), "db > INSERTED {d}, someusername, some@email.com", .{i});
+            const correctAnswer = fbs.getWritten();
+            fbs.reset();
+            try std.testing.expect(std.mem.eql(u8, answer, correctAnswer));
+        }
+
+        var isFirstLine = true;
+        for (usersToInsert, 0..) |_, i| {
+            try userInputStream.writer().print("select\n", .{});
+            if (isFirstLine) {
+                try dbOutputStream.reader().skipBytes(5, .{});
+                isFirstLine = false;
+            }
+            try dbOutputStream.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
+            const answer = fbs.getWritten();
+            fbs.reset();
+
+            try std.fmt.format(fbs.writer(), "ROW IDX: {d}, ID: {d}, USERNAME: someusername, EMAIL: some@email.com", .{ i, i });
+            const correctAnswer = fbs.getWritten();
+            fbs.reset();
+            try std.testing.expect(std.mem.eql(u8, answer, correctAnswer));
+        }
     }
 }
