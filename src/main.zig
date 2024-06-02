@@ -1,5 +1,4 @@
 const std = @import("std");
-const posix = std.posix;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
@@ -14,7 +13,7 @@ fn assert(ok: bool, err: DbError) !void {
 }
 
 const TAB_PAGE_SIZE = 4096;
-const TAB_MAX_PAGES = 100;
+const TAB_MAX_PAGES = 10000;
 const TAB_ROWS_PER_PAGE = TAB_PAGE_SIZE / ROW_SIZE;
 const TAB_MAX_ROWS = TAB_ROWS_PER_PAGE * TAB_MAX_PAGES;
 
@@ -256,7 +255,7 @@ const Statement = union(enum) {
 
 fn doMetaCmd(inbuf: *InputBuf) !void {
     if (inbuf.startsWith(".exit")) {
-        posix.exit(0);
+        std.posix.exit(0);
     } else {
         return DbError.General;
     }
@@ -360,10 +359,10 @@ test "inserts, selects, and exits for large number of rows" {
         // Parent process
         var buf: [4096]u8 = undefined;
         var fbs = std.io.fixedBufferStream(buf[0..]);
-        const usersToInsert: [1000]u32 = undefined;
+        const usersToInsert = 1000;
 
         // insert all the users
-        for (usersToInsert, 0..) |_, i| {
+        for (0..usersToInsert) |i| {
             try userInputStream.writer().print("insert {d} someusername some@email.com\n", .{i});
             try dbOutputStream.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
             const answer = fbs.getWritten();
@@ -375,13 +374,10 @@ test "inserts, selects, and exits for large number of rows" {
             try std.testing.expect(std.mem.eql(u8, answer, correctAnswer));
         }
 
-        var isFirstLine = true;
-        for (usersToInsert, 0..) |_, i| {
-            try userInputStream.writer().print("select\n", .{});
-            if (isFirstLine) {
-                try dbOutputStream.reader().skipBytes(5, .{});
-                isFirstLine = false;
-            }
+        // remove the 'db > ' from the first line
+        try dbOutputStream.reader().skipBytes(5, .{});
+        try userInputStream.writer().print("select\n", .{});
+        for (0..usersToInsert) |i| {
             try dbOutputStream.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
             const answer = fbs.getWritten();
             fbs.reset();
