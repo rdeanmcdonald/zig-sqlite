@@ -65,6 +65,14 @@ const Table = struct {
         };
     }
 
+    pub fn deinit(self: Self) void {
+        for (self.pages) |maybePage| {
+            if (maybePage) |page| {
+                self.allocator.destroy(page);
+            }
+        }
+    }
+
     pub fn insertRow(self: *Self, row: *Row) !void {
         if (self.nextAvailableRowIdx >= TAB_MAX_ROWS) {
             return error.TableFull;
@@ -119,6 +127,8 @@ const Row = struct {
     username_len: u8, // username can't be > 32 bits
     email: [EMAIL_SIZE]u8,
     email_len: u8, // email can't be > 255 bits
+
+    pub const rowFormat = "({d}, {s}, {s})\n";
 
     pub fn init(allocator: *Allocator) !*Self {
         return try allocator.create(Row);
@@ -204,7 +214,7 @@ const Select = struct {
         for (0..table.nextAvailableRowIdx) |i| {
             const validRead = try table.readRow(@intCast(i), row);
             if (validRead) {
-                try self.cli.writer.writer().print("ROW IDX: {d}, ID: {d}, USERNAME: {s}, EMAIL: {s}\n", .{ i, row.id, row.username[0..row.username_len], row.email[0..row.email_len] });
+                try self.cli.writer.writer().print(Row.rowFormat, .{ row.id, row.username[0..row.username_len], row.email[0..row.email_len] });
             }
         }
     }
@@ -280,6 +290,10 @@ const InputBuf = struct {
         };
     }
 
+    pub fn deinit(self: Self) void {
+        self.allocator.free(self.buf);
+    }
+
     pub fn read(self: *Self) !void {
         var fbs = std.io.fixedBufferStream(self.buf);
         try self.cli.reader.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
@@ -308,7 +322,9 @@ pub fn runDb(cli: *Cli) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     var allocator = gpa.allocator();
     var inbuf = try InputBuf.init(&allocator, cli);
+    defer inbuf.deinit();
     var table = Table.init(&allocator);
+    defer table.deinit();
     while (true) {
         // statement allocations are alloc/freed once per exec, all statement
         // execs can alloc without freeing
@@ -382,10 +398,10 @@ test "inserts, selects, and exits for large number of rows" {
             const answer = fbs.getWritten();
             fbs.reset();
 
-            try std.fmt.format(fbs.writer(), "ROW IDX: {d}, ID: {d}, USERNAME: someusername, EMAIL: some@email.com", .{ i, i });
+            try std.fmt.format(fbs.writer(), Row.rowFormat, .{ i, "someusername", "some@email.com" });
             const correctAnswer = fbs.getWritten();
             fbs.reset();
-            try std.testing.expect(std.mem.eql(u8, answer, correctAnswer));
+            try std.testing.expect(std.mem.eql(u8, answer, correctAnswer[0 .. correctAnswer.len - 1]));
         }
     }
 }
