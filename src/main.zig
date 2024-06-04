@@ -47,19 +47,18 @@ const Cli = struct {
     }
 };
 
-const Table = struct {
-    const Self = @This();
-    const Page = struct {
-        data: [TAB_PAGE_SIZE]u8,
-    };
+const Page = struct {
+    data: [TAB_PAGE_SIZE]u8,
+};
 
-    nextAvailableRowIdx: u32,
+const Pager = struct {
+    const Self = @This();
+
     pages: [TAB_MAX_PAGES]?*Page,
     allocator: *Allocator,
 
     pub fn init(allocator: *Allocator) Self {
         return Self{
-            .nextAvailableRowIdx = 0,
             .pages = undefined,
             .allocator = allocator,
         };
@@ -73,25 +72,49 @@ const Table = struct {
         }
     }
 
+    pub fn getOrCreatePage(self: *Self, idx: u32) !*Page {
+        if (self.pages[idx]) |page| {
+            return page;
+        } else {
+            const page = try self.allocator.create(Page);
+            self.pages[idx] = page;
+            return page;
+        }
+    }
+
+    pub fn getPage(self: *Self, idx: u32) !?*Page {
+        try assert(idx < TAB_MAX_PAGES, DbError.General);
+        return self.pages[idx];
+    }
+};
+
+const Table = struct {
+    const Self = @This();
+
+    nextAvailableRowIdx: u32,
+    pager: *Pager,
+
+    pub fn init(pager: *Pager) Self {
+        return Self{
+            .nextAvailableRowIdx = 0,
+            .pager = pager,
+        };
+    }
+
     pub fn insertRow(self: *Self, row: *Row) !void {
         if (self.nextAvailableRowIdx >= TAB_MAX_ROWS) {
             return error.TableFull;
         }
 
         const rowIdxOnPage, const pageIdx = self.getIdxsFromRowIdx(self.nextAvailableRowIdx);
-        if (self.pages[pageIdx]) |page| {
-            try self.writeRowData(rowIdxOnPage, row, page);
-        } else {
-            const page = try self.allocator.create(Page);
-            self.pages[pageIdx] = page;
-            try self.writeRowData(rowIdxOnPage, row, page);
-        }
+        const page = try self.pager.getOrCreatePage(pageIdx);
+        try self.writeRowData(rowIdxOnPage, row, page);
     }
 
-    /// .{rowIdxInPage, pageIdx}
     fn getIdxsFromRowIdx(_: *Self, rowIdx: u32) [2]u32 {
-        const mod = @mod(rowIdx, TAB_ROWS_PER_PAGE);
-        return .{ mod, @divFloor(rowIdx, TAB_ROWS_PER_PAGE) };
+        const rowIdxInPage = @mod(rowIdx, TAB_ROWS_PER_PAGE);
+        const pageIdx = @divFloor(rowIdx, TAB_ROWS_PER_PAGE);
+        return .{ rowIdxInPage, pageIdx };
     }
 
     fn getRowSliceFromIdx(_: *Self, idx: u32, page: *Page) []u8 {
@@ -109,7 +132,7 @@ const Table = struct {
 
     pub fn readRow(self: *Self, idx: u32, row: *Row) !bool {
         const rowIdxOnPage, const pageIdx = self.getIdxsFromRowIdx(idx);
-        if (self.pages[pageIdx]) |page| {
+        if (try self.pager.getPage(pageIdx)) |page| {
             const rowSlice = self.getRowSliceFromIdx(rowIdxOnPage, page);
             try row.deserializeFromSlice(rowSlice);
             return true;
@@ -323,8 +346,9 @@ pub fn runDb(cli: *Cli) !void {
     var allocator = gpa.allocator();
     var inbuf = try InputBuf.init(&allocator, cli);
     defer inbuf.deinit();
-    var table = Table.init(&allocator);
-    defer table.deinit();
+    var pager = Pager.init(&allocator);
+    defer pager.deinit();
+    var table = Table.init(&pager);
     while (true) {
         // statement allocations are alloc/freed once per exec, all statement
         // execs can alloc without freeing
