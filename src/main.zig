@@ -56,12 +56,34 @@ const Pager = struct {
 
     pages: [TAB_MAX_PAGES]?*Page,
     allocator: *Allocator,
+    file: std.fs.File,
+    fileLength: u64,
 
-    pub fn init(allocator: *Allocator) Self {
-        return Self{
+    pub fn init(allocator: *Allocator, filename: []const u8) !Self {
+        const file = std.fs.File{ .handle = try std.posix.open(filename, std.posix.O{ .ACCMODE = .RDWR, .CREAT = true }, 0o666) };
+        const fileLength = try file.getEndPos();
+        var pager = Self{
             .pages = undefined,
             .allocator = allocator,
+            .file = file,
+            .fileLength = fileLength,
         };
+
+        const lastPageIdx = @divFloor(fileLength, TAB_PAGE_SIZE);
+        var pageIdx: usize = 0;
+        var offset: usize = 0;
+        while (pageIdx <= lastPageIdx) : ({
+            pageIdx += 1;
+            offset += TAB_PAGE_SIZE;
+        }) {
+            var page = try pager.createPage(pageIdx);
+            // pread all will only read data.len or less if there's no more
+            // data, so even the last page with potentially partial data is
+            // safe to do this.
+            _ = try file.preadAll(page.data[0..], offset);
+        }
+
+        return pager;
     }
 
     pub fn deinit(self: Self) void {
@@ -72,17 +94,21 @@ const Pager = struct {
         }
     }
 
-    pub fn getOrCreatePage(self: *Self, idx: u32) !*Page {
+    pub fn createPage(self: *Self, idx: u64) !*Page {
+        const page = try self.allocator.create(Page);
+        self.pages[idx] = page;
+        return page;
+    }
+
+    pub fn getOrCreatePage(self: *Self, idx: u64) !*Page {
         if (self.pages[idx]) |page| {
             return page;
         } else {
-            const page = try self.allocator.create(Page);
-            self.pages[idx] = page;
-            return page;
+            return self.createPage(idx);
         }
     }
 
-    pub fn getPage(self: *Self, idx: u32) !?*Page {
+    pub fn getPage(self: *Self, idx: u64) !?*Page {
         try assert(idx < TAB_MAX_PAGES, DbError.General);
         return self.pages[idx];
     }
@@ -91,46 +117,46 @@ const Pager = struct {
 const Table = struct {
     const Self = @This();
 
-    nextAvailableRowIdx: u32,
+    numRows: u64,
     pager: *Pager,
 
     pub fn init(pager: *Pager) Self {
+        const numRows = @divFloor(pager.fileLength, ROW_SIZE);
         return Self{
-            .nextAvailableRowIdx = 0,
+            .numRows = @divFloor(pager.fileLength, ROW_SIZE),
             .pager = pager,
         };
     }
 
     pub fn insertRow(self: *Self, row: *Row) !void {
-        if (self.nextAvailableRowIdx >= TAB_MAX_ROWS) {
+        if (self.numRows >= TAB_MAX_ROWS) {
             return error.TableFull;
         }
 
-        const rowIdxOnPage, const pageIdx = self.getIdxsFromRowIdx(self.nextAvailableRowIdx);
+        const rowIdxOnPage, const pageIdx = self.getIdxsFromRowIdx(self.numRows);
         const page = try self.pager.getOrCreatePage(pageIdx);
         try self.writeRowData(rowIdxOnPage, row, page);
     }
 
-    fn getIdxsFromRowIdx(_: *Self, rowIdx: u32) [2]u32 {
+    fn getIdxsFromRowIdx(_: *Self, rowIdx: u64) [2]u64 {
         const rowIdxInPage = @mod(rowIdx, TAB_ROWS_PER_PAGE);
         const pageIdx = @divFloor(rowIdx, TAB_ROWS_PER_PAGE);
         return .{ rowIdxInPage, pageIdx };
     }
 
-    fn getRowSliceFromIdx(_: *Self, idx: u32, page: *Page) []u8 {
+    fn getRowSliceFromIdx(_: *Self, idx: u64, page: *Page) []u8 {
         const rowOffset = idx * ROW_SIZE;
         return page.data[rowOffset .. rowOffset + ROW_SIZE];
     }
 
-    fn writeRowData(self: *Self, rowIdxOnPage: u32, row: *Row, page: *Page) !void {
+    fn writeRowData(self: *Self, rowIdxOnPage: u64, row: *Row, page: *Page) !void {
         const rowSlice = self.getRowSliceFromIdx(rowIdxOnPage, page);
 
         try row.serializeToSlice(rowSlice);
-        self.nextAvailableRowIdx += 1;
-        // std.debug.print("PAGE DATA {any}\n", .{page.data});
+        self.numRows += 1;
     }
 
-    pub fn readRow(self: *Self, idx: u32, row: *Row) !bool {
+    pub fn readRow(self: *Self, idx: u64, row: *Row) !bool {
         const rowIdxOnPage, const pageIdx = self.getIdxsFromRowIdx(idx);
         if (try self.pager.getPage(pageIdx)) |page| {
             const rowSlice = self.getRowSliceFromIdx(rowIdxOnPage, page);
@@ -138,6 +164,38 @@ const Table = struct {
             return true;
         } else {
             return false;
+        }
+    }
+
+    /// Write every page to the file, except the last page which might not be
+    /// full
+    pub fn close(self: *Self) !void {
+        var offset: usize = 0;
+        var pageNum: usize = 0;
+// LAST FULL PAGE: 0
+// ROWS PER PAGE: 13
+// PAGE NUM: 0
+// OFFSET: 0
+// NOT PARTIAL PAGE
+// PAGE NUM: 1
+// OFFSET: 4096
+// POTENTIAL PARTIAL PAGE
+// PAGE NUM: 2
+// OFFSET: 8192
+// POTENTIAL PARTIAL PAGE
+        const lastFullPage = @divFloor(self.numRows, TAB_ROWS_PER_PAGE) - 1;
+        while (self.pager.pages[pageNum]) |page| : ({
+            offset += page.data.len;
+            pageNum += 1;
+        }) {
+            if (pageNum <= lastFullPage) {
+                try self.pager.file.pwriteAll(page.data[0..], offset);
+            } else {
+                // last page, will break out of while loop next
+                const rowIdxOnPage, _ = self.getIdxsFromRowIdx(self.numRows);
+                const lastRowLastByte = rowIdxOnPage * ROW_SIZE;
+                try self.pager.file.pwriteAll(page.data[0 .. lastRowLastByte], offset);
+            }
         }
     }
 };
@@ -234,7 +292,7 @@ const Select = struct {
 
     pub fn exec(self: Self, table: *Table) !void {
         const row = try Row.init(self.arena);
-        for (0..table.nextAvailableRowIdx) |i| {
+        for (0..table.numRows) |i| {
             const validRead = try table.readRow(@intCast(i), row);
             if (validRead) {
                 try self.cli.writer.writer().print(Row.rowFormat, .{ row.id, row.username[0..row.username_len], row.email[0..row.email_len] });
@@ -247,6 +305,22 @@ const Select = struct {
     }
 };
 
+const Exit = struct {
+    const Self = @This();
+
+    cli: *Cli,
+
+    pub fn exec(self: Self, table: *Table) !void {
+        try self.cli.writer.writer().print("Shutting down the db...\n", .{});
+        try table.close();
+        std.posix.exit(0);
+    }
+
+    pub fn init(cli: *Cli) Self {
+        return Self{ .cli = cli };
+    }
+};
+
 // Basic "interface" using tagged enum approach
 // See: https://zig.news/kristoff/easy-interfaces-with-zig-0100-2hc5
 const Statement = union(enum) {
@@ -254,6 +328,7 @@ const Statement = union(enum) {
 
     insert: Insert,
     select: Select,
+    exit: Exit,
 
     pub fn init(inbuf: *InputBuf, arena: *Allocator, cli: *Cli) !Self {
         var tokens = mem.splitScalar(u8, inbuf.getInput(), ' ');
@@ -276,6 +351,11 @@ const Statement = union(enum) {
             };
         }
 
+        if (mem.eql(u8, cmd, ".exit")) {
+            return Self{
+                .exit = Exit{ .cli = cli },
+            };
+        }
         return DbError.General;
     }
 
@@ -285,14 +365,6 @@ const Statement = union(enum) {
         }
     }
 };
-
-fn doMetaCmd(inbuf: *InputBuf) !void {
-    if (inbuf.startsWith(".exit")) {
-        std.posix.exit(0);
-    } else {
-        return DbError.General;
-    }
-}
 
 const InputBuf = struct {
     buf: []u8,
@@ -341,12 +413,12 @@ fn printPromptAndFlush(cli: *Cli) !void {
     try cli.writer.flush();
 }
 
-pub fn runDb(cli: *Cli) !void {
+pub fn runDb(cli: *Cli, filename: []const u8) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     var allocator = gpa.allocator();
     var inbuf = try InputBuf.init(&allocator, cli);
     defer inbuf.deinit();
-    var pager = Pager.init(&allocator);
+    var pager = try Pager.init(&allocator, filename);
     defer pager.deinit();
     var table = Table.init(&pager);
     while (true) {
@@ -359,12 +431,6 @@ pub fn runDb(cli: *Cli) !void {
 
         try printPromptAndFlush(cli);
         try inbuf.read();
-        if (inbuf.startsWith(".")) {
-            if (doMetaCmd(&inbuf)) |_| {} else |_| {
-                try cli.writer.writer().print("Unrecognized meta command: <<<{s}>>>\n", .{inbuf.getInput()});
-            }
-            continue;
-        }
         if (Statement.init(&inbuf, &arena, cli)) |s| {
             try s.exec(&table);
         } else |err| {
@@ -377,24 +443,43 @@ pub fn main() !void {
     var inStream = std.io.StreamSource{ .file = std.io.getStdIn() };
     var outStream = std.io.StreamSource{ .file = std.io.getStdOut() };
     var cli = Cli.init(inStream.reader(), outStream.writer());
-    try runDb(&cli);
+    var args = std.process.args();
+    _ = args.skip();
+    if (args.next()) |filename| {
+        try runDb(&cli, filename);
+    }
+    try cli.writer.writer().print("Please provide a db filename\n", .{});
+    try cli.writer.flush();
 }
 
 test "inserts, selects, and exits for large number of rows" {
+    // Create the test IO things
     const inPipeReadEnd, const inPipeWriteEnd = try std.posix.pipe();
     const outPipeReadEnd, const outPipeWriteEnd = try std.posix.pipe();
     var cliInStream = std.io.StreamSource{ .file = std.fs.File{ .handle = inPipeReadEnd } };
     var cliOutStream = std.io.StreamSource{ .file = std.fs.File{ .handle = outPipeWriteEnd } };
     var userInputStream = std.io.StreamSource{ .file = std.fs.File{ .handle = inPipeWriteEnd } };
     var dbOutputStream = std.io.StreamSource{ .file = std.fs.File{ .handle = outPipeReadEnd } };
-
     var cli = Cli.init(cliInStream.reader(), cliOutStream.writer());
 
+    // Create the test temp db file
+    // var tmpDir = std.testing.tmpDir(.{});
+    // defer tmpDir.cleanup();
+    // var buffer: [1000]u8 = undefined;
+    // var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    // defer fba.reset();
+    // const tmpDirPath = try tmpDir.dir.realpathAlloc(fba.allocator(), ".");
+    // const filename = "/temp.db";
+    // var tmpDbFilePath = try fba.allocator().alloc(u8, tmpDirPath.len + filename.len);
+    // std.mem.copyForwards(u8, tmpDbFilePath, tmpDirPath);
+    // std.mem.copyForwards(u8, tmpDbFilePath[tmpDirPath.len..], filename);
+
+    const tmpDbFilePath = "/home/rmcdonald/random/test.db";
     // Fork the process, and run the db in the child
     const fork_pid = try std.posix.fork();
     if (fork_pid == 0) {
         // Child process
-        try runDb(&cli);
+        try runDb(&cli, tmpDbFilePath);
     } else {
         // Parent process
         var buf: [4096]u8 = undefined;
@@ -427,5 +512,8 @@ test "inserts, selects, and exits for large number of rows" {
             fbs.reset();
             try std.testing.expect(std.mem.eql(u8, answer, correctAnswer[0 .. correctAnswer.len - 1]));
         }
+
+        // Confirm exit persists the data
+        try userInputStream.writer().print(".exit\n", .{});
     }
 }
