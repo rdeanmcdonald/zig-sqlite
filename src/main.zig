@@ -13,7 +13,7 @@ fn assert(ok: bool, err: DbError) !void {
 }
 
 const TAB_PAGE_SIZE = 4096;
-const TAB_MAX_PAGES = 10000;
+const TAB_MAX_PAGES = 1000;
 const TAB_ROWS_PER_PAGE = TAB_PAGE_SIZE / ROW_SIZE;
 const TAB_MAX_ROWS = TAB_ROWS_PER_PAGE * TAB_MAX_PAGES;
 
@@ -57,7 +57,7 @@ const Pager = struct {
     pages: [TAB_MAX_PAGES]?*Page,
     allocator: *Allocator,
     file: std.fs.File,
-    fileLength: u64,
+    numRows: u64,
 
     pub fn init(allocator: *Allocator, filename: []const u8) !Self {
         const file = std.fs.File{ .handle = try std.posix.open(filename, std.posix.O{ .ACCMODE = .RDWR, .CREAT = true }, 0o666) };
@@ -66,10 +66,14 @@ const Pager = struct {
             .pages = undefined,
             .allocator = allocator,
             .file = file,
-            .fileLength = fileLength,
+            .numRows = 0,
         };
 
-        const lastPageIdx = @divFloor(fileLength, TAB_PAGE_SIZE);
+        if (fileLength == 0) {
+            return pager;
+        }
+
+        const lastPageIdx = @divFloor(fileLength - 1, TAB_PAGE_SIZE);
         var pageIdx: usize = 0;
         var offset: usize = 0;
         while (pageIdx <= lastPageIdx) : ({
@@ -80,7 +84,8 @@ const Pager = struct {
             // pread all will only read data.len or less if there's no more
             // data, so even the last page with potentially partial data is
             // safe to do this.
-            _ = try file.preadAll(page.data[0..], offset);
+            const bytesRead = try file.preadAll(page.data[0..], offset);
+            pager.numRows += @divFloor(bytesRead, ROW_SIZE);
         }
 
         return pager;
@@ -117,23 +122,20 @@ const Pager = struct {
 const Table = struct {
     const Self = @This();
 
-    numRows: u64,
     pager: *Pager,
 
     pub fn init(pager: *Pager) Self {
-        const numRows = @divFloor(pager.fileLength, ROW_SIZE);
         return Self{
-            .numRows = @divFloor(pager.fileLength, ROW_SIZE),
             .pager = pager,
         };
     }
 
     pub fn insertRow(self: *Self, row: *Row) !void {
-        if (self.numRows >= TAB_MAX_ROWS) {
+        if (self.pager.numRows >= TAB_MAX_ROWS) {
             return error.TableFull;
         }
 
-        const rowIdxOnPage, const pageIdx = self.getIdxsFromRowIdx(self.numRows);
+        const rowIdxOnPage, const pageIdx = self.getIdxsFromRowIdx(self.pager.numRows);
         const page = try self.pager.getOrCreatePage(pageIdx);
         try self.writeRowData(rowIdxOnPage, row, page);
     }
@@ -153,7 +155,7 @@ const Table = struct {
         const rowSlice = self.getRowSliceFromIdx(rowIdxOnPage, page);
 
         try row.serializeToSlice(rowSlice);
-        self.numRows += 1;
+        self.pager.numRows += 1;
     }
 
     pub fn readRow(self: *Self, idx: u64, row: *Row) !bool {
@@ -170,31 +172,27 @@ const Table = struct {
     /// Write every page to the file, except the last page which might not be
     /// full
     pub fn close(self: *Self) !void {
+        if (self.pager.numRows == 0) {
+            return;
+        }
         var offset: usize = 0;
-        var pageNum: usize = 0;
-// LAST FULL PAGE: 0
-// ROWS PER PAGE: 13
-// PAGE NUM: 0
-// OFFSET: 0
-// NOT PARTIAL PAGE
-// PAGE NUM: 1
-// OFFSET: 4096
-// POTENTIAL PARTIAL PAGE
-// PAGE NUM: 2
-// OFFSET: 8192
-// POTENTIAL PARTIAL PAGE
-        const lastFullPage = @divFloor(self.numRows, TAB_ROWS_PER_PAGE) - 1;
-        while (self.pager.pages[pageNum]) |page| : ({
+        var pageIdx: usize = 0;
+        const lastPageIdx = @divFloor(self.pager.numRows - 1, TAB_ROWS_PER_PAGE);
+        const lastPageIsPartial = @mod(self.pager.numRows, TAB_ROWS_PER_PAGE) != 0;
+        var bytesWritten: usize = 0;
+        while (self.pager.pages[pageIdx]) |page| : ({
             offset += page.data.len;
-            pageNum += 1;
+            pageIdx += 1;
         }) {
-            if (pageNum <= lastFullPage) {
-                try self.pager.file.pwriteAll(page.data[0..], offset);
-            } else {
-                // last page, will break out of while loop next
-                const rowIdxOnPage, _ = self.getIdxsFromRowIdx(self.numRows);
+            if (pageIdx == lastPageIdx and lastPageIsPartial) {
+                // last page is partial page, will break out of while loop next
+                const rowIdxOnPage, _ = self.getIdxsFromRowIdx(self.pager.numRows);
                 const lastRowLastByte = rowIdxOnPage * ROW_SIZE;
-                try self.pager.file.pwriteAll(page.data[0 .. lastRowLastByte], offset);
+                try self.pager.file.pwriteAll(page.data[0..lastRowLastByte], offset);
+                bytesWritten += lastRowLastByte;
+            } else {
+                try self.pager.file.pwriteAll(page.data[0..], offset);
+                bytesWritten += page.data.len;
             }
         }
     }
@@ -274,9 +272,10 @@ const Insert = struct {
     row: *Row,
     cli: *Cli,
 
-    pub fn exec(self: Self, table: *Table) !void {
+    pub fn exec(self: Self, table: *Table) !bool {
         try table.insertRow(self.row);
         try self.cli.writer.writer().print("INSERTED {d}, {s}, {s}\n", .{ self.row.id, self.row.username[0..self.row.username_len], self.row.email[0..self.row.email_len] });
+        return true;
     }
 
     pub fn init(idUtf8: []const u8, usernameUtf8: []const u8, emailUtf8: []const u8, arena: *Allocator, cli: *Cli) !Self {
@@ -290,14 +289,15 @@ const Select = struct {
     arena: *Allocator,
     cli: *Cli,
 
-    pub fn exec(self: Self, table: *Table) !void {
+    pub fn exec(self: Self, table: *Table) !bool {
         const row = try Row.init(self.arena);
-        for (0..table.numRows) |i| {
+        for (0..table.pager.numRows) |i| {
             const validRead = try table.readRow(@intCast(i), row);
             if (validRead) {
                 try self.cli.writer.writer().print(Row.rowFormat, .{ row.id, row.username[0..row.username_len], row.email[0..row.email_len] });
             }
         }
+        return true;
     }
 
     pub fn init(arena: *Allocator, cli: *Cli) Self {
@@ -310,10 +310,10 @@ const Exit = struct {
 
     cli: *Cli,
 
-    pub fn exec(self: Self, table: *Table) !void {
+    pub fn exec(self: Self, table: *Table) !bool {
         try self.cli.writer.writer().print("Shutting down the db...\n", .{});
         try table.close();
-        std.posix.exit(0);
+        return false;
     }
 
     pub fn init(cli: *Cli) Self {
@@ -359,9 +359,9 @@ const Statement = union(enum) {
         return DbError.General;
     }
 
-    pub fn exec(self: Self, table: *Table) !void {
+    pub fn exec(self: Self, table: *Table) !bool {
         switch (self) {
-            inline else => |case| try case.exec(table),
+            inline else => |case| return try case.exec(table),
         }
     }
 };
@@ -432,11 +432,13 @@ pub fn runDb(cli: *Cli, filename: []const u8) !void {
         try printPromptAndFlush(cli);
         try inbuf.read();
         if (Statement.init(&inbuf, &arena, cli)) |s| {
-            try s.exec(&table);
+            const keepGoing = try s.exec(&table);
+            if (!keepGoing) break;
         } else |err| {
             try cli.writer.writer().print("ERROR <<<{any}>>> FOR INPUT <<<{s}>>>\n", .{ err, inbuf.getInput() });
         }
     }
+    try cli.writer.flush();
 }
 
 pub fn main() !void {
@@ -447,9 +449,9 @@ pub fn main() !void {
     _ = args.skip();
     if (args.next()) |filename| {
         try runDb(&cli, filename);
+    } else {
+        try cli.writer.writer().print("Please provide a db filename\n", .{});
     }
-    try cli.writer.writer().print("Please provide a db filename\n", .{});
-    try cli.writer.flush();
 }
 
 test "inserts, selects, and exits for large number of rows" {
@@ -463,57 +465,95 @@ test "inserts, selects, and exits for large number of rows" {
     var cli = Cli.init(cliInStream.reader(), cliOutStream.writer());
 
     // Create the test temp db file
-    // var tmpDir = std.testing.tmpDir(.{});
-    // defer tmpDir.cleanup();
-    // var buffer: [1000]u8 = undefined;
-    // var fba = std.heap.FixedBufferAllocator.init(&buffer);
-    // defer fba.reset();
-    // const tmpDirPath = try tmpDir.dir.realpathAlloc(fba.allocator(), ".");
-    // const filename = "/temp.db";
-    // var tmpDbFilePath = try fba.allocator().alloc(u8, tmpDirPath.len + filename.len);
-    // std.mem.copyForwards(u8, tmpDbFilePath, tmpDirPath);
-    // std.mem.copyForwards(u8, tmpDbFilePath[tmpDirPath.len..], filename);
+    var tmpDir = std.testing.tmpDir(.{});
+    defer tmpDir.cleanup();
+    var buffer: [1000]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    defer fba.reset();
+    const tmpDirPath = try tmpDir.dir.realpathAlloc(fba.allocator(), ".");
+    const filename = "/temp.db";
+    var tmpDbFilePath = try fba.allocator().alloc(u8, tmpDirPath.len + filename.len);
+    std.mem.copyForwards(u8, tmpDbFilePath, tmpDirPath);
+    std.mem.copyForwards(u8, tmpDbFilePath[tmpDirPath.len..], filename);
 
-    const tmpDbFilePath = "/home/rmcdonald/random/test.db";
     // Fork the process, and run the db in the child
-    const fork_pid = try std.posix.fork();
+    var fork_pid = try std.posix.fork();
     if (fork_pid == 0) {
         // Child process
         try runDb(&cli, tmpDbFilePath);
-    } else {
-        // Parent process
-        var buf: [4096]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(buf[0..]);
-        const usersToInsert = 1000;
-
-        // insert all the users
-        for (0..usersToInsert) |i| {
-            try userInputStream.writer().print("insert {d} someusername some@email.com\n", .{i});
-            try dbOutputStream.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
-            const answer = fbs.getWritten();
-            fbs.reset();
-
-            try std.fmt.format(fbs.writer(), "db > INSERTED {d}, someusername, some@email.com", .{i});
-            const correctAnswer = fbs.getWritten();
-            fbs.reset();
-            try std.testing.expect(std.mem.eql(u8, answer, correctAnswer));
-        }
-
-        // remove the 'db > ' from the first line
-        try dbOutputStream.reader().skipBytes(5, .{});
-        try userInputStream.writer().print("select\n", .{});
-        for (0..usersToInsert) |i| {
-            try dbOutputStream.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
-            const answer = fbs.getWritten();
-            fbs.reset();
-
-            try std.fmt.format(fbs.writer(), Row.rowFormat, .{ i, "someusername", "some@email.com" });
-            const correctAnswer = fbs.getWritten();
-            fbs.reset();
-            try std.testing.expect(std.mem.eql(u8, answer, correctAnswer[0 .. correctAnswer.len - 1]));
-        }
-
-        // Confirm exit persists the data
-        try userInputStream.writer().print(".exit\n", .{});
+        std.posix.exit(0);
     }
+
+    // Parent process
+    var buf: [4096]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(buf[0..]);
+    const usersToInsert = 100;
+
+    // insert all the users
+    for (0..usersToInsert) |i| {
+        try userInputStream.writer().print("insert {d} someusername some@email.com\n", .{i});
+        try dbOutputStream.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
+        const answer = fbs.getWritten();
+        fbs.reset();
+
+        try std.fmt.format(fbs.writer(), "db > INSERTED {d}, someusername, some@email.com", .{i});
+        const correctAnswer = fbs.getWritten();
+        fbs.reset();
+        try std.testing.expect(std.mem.eql(u8, answer, correctAnswer));
+    }
+
+    // remove the 'db > ' from the first line
+    try dbOutputStream.reader().skipBytes(5, .{});
+    try userInputStream.writer().print("select\n", .{});
+    for (0..usersToInsert) |i| {
+        try dbOutputStream.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
+        const answer = fbs.getWritten();
+        fbs.reset();
+
+        try std.fmt.format(fbs.writer(), Row.rowFormat, .{ i, "someusername", "some@email.com" });
+        const correctAnswer = fbs.getWritten();
+        fbs.reset();
+        try std.testing.expect(std.mem.eql(u8, answer, correctAnswer[0 .. correctAnswer.len - 1]));
+    }
+
+    // Confirm exit
+    try userInputStream.writer().print(".exit\n", .{});
+    try dbOutputStream.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
+    var exitText = fbs.getWritten();
+    fbs.reset();
+
+    try std.testing.expect(std.mem.eql(u8, exitText, "db > Shutting down the db..."));
+    var dbstatus = std.posix.waitpid(fork_pid, 0).status;
+    try std.testing.expect(dbstatus == 0);
+
+    // confirm data was persisted
+    fork_pid = try std.posix.fork();
+    if (fork_pid == 0) {
+        // Child process
+        try runDb(&cli, tmpDbFilePath);
+        std.posix.exit(0);
+    }
+
+    try dbOutputStream.reader().skipBytes(5, .{});
+    try userInputStream.writer().print("select\n", .{});
+    for (0..usersToInsert) |i| {
+        try dbOutputStream.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
+        const answer = fbs.getWritten();
+        fbs.reset();
+
+        try std.fmt.format(fbs.writer(), Row.rowFormat, .{ i, "someusername", "some@email.com" });
+        const correctAnswer = fbs.getWritten();
+        fbs.reset();
+        try std.testing.expect(std.mem.eql(u8, answer, correctAnswer[0 .. correctAnswer.len - 1]));
+    }
+
+    // Confirm exit
+    try userInputStream.writer().print(".exit\n", .{});
+    try dbOutputStream.reader().streamUntilDelimiter(fbs.writer(), '\n', null);
+    exitText = fbs.getWritten();
+    fbs.reset();
+
+    try std.testing.expect(std.mem.eql(u8, exitText, "db > Shutting down the db..."));
+    dbstatus = std.posix.waitpid(fork_pid, 0).status;
+    try std.testing.expect(dbstatus == 0);
 }
