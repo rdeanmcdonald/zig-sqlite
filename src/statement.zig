@@ -5,6 +5,7 @@ const Cli = @import("cli.zig");
 const InputBuf = @import("input_buffer.zig");
 const Table = @import("table.zig");
 const Row = @import("row.zig");
+const Cursor = @import("cursor.zig");
 const e = @import("errors.zig");
 
 // Basic "interface" using tagged enum approach
@@ -59,7 +60,8 @@ const Insert = struct {
     cli: *Cli,
 
     pub fn exec(self: Self, table: *Table) !bool {
-        try table.insertRow(self.row);
+        var cursor = Cursor.initAtEnd(table);
+        try table.insertRow(self.row, &cursor);
         try self.cli.writer.writer().print("INSERTED {d}, {s}, {s}\n", .{ self.row.id, self.row.username[0..self.row.username_len], self.row.email[0..self.row.email_len] });
         return true;
     }
@@ -76,12 +78,12 @@ const Select = struct {
     cli: *Cli,
 
     pub fn exec(self: Self, table: *Table) !bool {
+        var cursor = Cursor.initAtStart(table);
         const row = try Row.init(self.arena);
-        for (0..table.numRows) |i| {
-            const validRead = try table.readRow(@intCast(i), row);
-            if (validRead) {
-                try self.cli.writer.writer().print(Row.rowFormat, .{ row.id, row.username[0..row.username_len], row.email[0..row.email_len] });
-            }
+        while (!cursor.endOfTable) {
+            try cursor.readRow(row);
+            try self.cli.writer.writer().print(Row.rowFormat, .{ row.id, row.username[0..row.username_len], row.email[0..row.email_len] });
+            cursor.advance();
         }
         return true;
     }
