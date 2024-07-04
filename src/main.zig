@@ -10,6 +10,7 @@ const Row = @import("row.zig");
 const Table = @import("table.zig");
 const InputBuf = @import("input_buffer.zig");
 const Statement = @import("statement.zig").Statement;
+const n = @import("node.zig");
 
 fn printPromptAndFlush(cli: *Cli) !void {
     try cli.writer.writer().print("db > ", .{});
@@ -45,16 +46,30 @@ pub fn runDb(cli: *Cli, filename: []const u8) !void {
 }
 
 pub fn main() !void {
-    var inStream = std.io.StreamSource{ .file = std.io.getStdIn() };
-    var outStream = std.io.StreamSource{ .file = std.io.getStdOut() };
-    var cli = Cli.init(inStream.reader(), outStream.writer());
-    var args = std.process.args();
-    _ = args.skip();
-    if (args.next()) |filename| {
-        try runDb(&cli, filename);
-    } else {
-        try cli.writer.writer().print("Please provide a db filename\n", .{});
+    var node: n.Node = undefined;
+    for (0..4096) |i| {
+        var intBytes: [@sizeOf(usize)]u8 = undefined;
+        mem.writePackedIntNative(usize, intBytes[0..], 0, i);
+        node[i] = intBytes[0];
     }
+
+    const nodePtr: *n.Node = &node;
+    std.debug.print("NODE {*}\n", .{nodePtr});
+    const ptr = n.leafNodeNumCells(&node);
+    std.debug.print("PTR {d}\n", .{ptr});
+    std.debug.print("PTR {d}\n", .{ptr.*});
+    n.initializeLeafeNode(&node);
+    std.debug.print("PTR {d}\n", .{ptr.*});
+    // var inStream = std.io.StreamSource{ .file = std.io.getStdIn() };
+    // var outStream = std.io.StreamSource{ .file = std.io.getStdOut() };
+    // var cli = Cli.init(inStream.reader(), outStream.writer());
+    // var args = std.process.args();
+    // _ = args.skip();
+    // if (args.next()) |filename| {
+    //     try runDb(&cli, filename);
+    // } else {
+    //     try cli.writer.writer().print("Please provide a db filename\n", .{});
+    // }
 }
 
 test "inserts, selects, and persists large number of rows" {
