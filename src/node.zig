@@ -104,17 +104,24 @@ fn initU64Value(data: *[1024]u8) void {
     std.debug.print("INTERNAL VAL {d}\n", .{ptr.*});
 }
 
-test "example" {
-    var data: [1024]u8 = undefined;
-    // set up some initial bytes
-    for (0..1024) |i| {
-        var intBytes: [@sizeOf(usize)]u8 = undefined;
-        mem.writePackedIntNative(usize, intBytes[0..], 0, i);
-        data[i] = intBytes[0];
+fn hi() !i32 {
+    var a: i32 = 1;
+    const a_ptr = &a;
+    var prng = std.Random.DefaultPrng.init(blk: {
+        var seed: u64 = undefined;
+        try std.posix.getrandom(std.mem.asBytes(&seed));
+        break :blk seed;
+    });
+    const num = prng.random().int(i32);
+
+    std.debug.print("NUM: {d}\n", .{num});
+    if (num > 0) {
+        a_ptr.* = 3;
     }
-    const ptr = getU64Ptr(&data);
-    std.debug.print("PTR {*}\n", .{ptr});
-    std.debug.print("FIRST VAL {d}\n", .{ptr.*});
-    initU64Value(&data);
-    std.debug.print("INITIALIZED VAL {d}\n", .{ptr.*});
+    std.debug.print("A: {d}\n", .{a});
+    return a;
+}
+
+test "example" {
+    _ = try hi();
 }
